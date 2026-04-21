@@ -1,0 +1,103 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "FlyDSL",
+  "projectDescription": "A Python DSL and MLIR-based compiler stack for authoring high-performance GPU kernels with explicit layout algebra and tiling on AMD ROCm hardware.",
+  "theme": "aspen",
+  "primaryColor": "#2f81f7",
+  "lightColor": "#5ba3fa",
+  "darkColor": "#1a5bbf",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/layout-system"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/kernel-authoring",
+              "guides/autotuning",
+              "guides/advanced-patterns"
+            ]
+          },
+          {
+            "group": "Pre-built Kernels",
+            "pages": [
+              "kernels/overview",
+              "kernels/gemm",
+              "kernels/normalization",
+              "kernels/attention-and-misc"
+            ]
+          },
+          {
+            "group": "Testing & Benchmarks",
+            "pages": [
+              "testing/testing",
+              "testing/benchmarking"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": [
+              "api/expr",
+              "api/compiler",
+              "api/runtime",
+              "api/autotune"
+            ]
+          },
+          {
+            "group": "Fly Dialect",
+            "pages": [
+              "api/dialect-overview",
+              "api/layout-ops",
+              "api/copy-mma-atoms"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Python DSL (@flyc.kernel / @flyc.jit) for writing GPU kernels with layout algebra",
+    "Explicit tiling hierarchy across block, warp, thread, and instruction scopes",
+    "MLIR-native Fly dialect with layout IR, coordinate mapping, and composable lowering pipeline",
+    "Embedded MLIR Python runtime — no external mlir wheel required",
+    "JIT compilation with disk caching to AMD GPU binaries (ROCDL/fatbin)",
+    "Production kernels: GEMM (preshuffle, blockscale, MoE), FlashAttention, LayerNorm, RMSNorm, Softmax, PagedAttention",
+    "Triton-style autotuner (@autotune decorator) for searching tile configurations",
+    "Support for AMD CDNA3/CDNA4 (MI300X/MI350/MI355X) and RDNA4/gfx1250 (MI450)"
+  ],
+  "publicApiSurface": [
+    "@flyc.kernel — decorate a Python function as a GPU kernel",
+    "@flyc.jit — JIT-compile and launch a host-side function",
+    "@autotune(configs, key) — Triton-style autotuner decorator",
+    "flydsl.expr (fx) — layout, copy, arithmetic, vector, GPU, ROCDL ops",
+    "fx.make_layout / fx.make_shape / fx.make_stride / fx.make_coord",
+    "fx.crd2idx / fx.idx2crd — coordinate ↔ linear index mapping",
+    "fx.composition / fx.logical_product / fx.logical_divide — layout algebra",
+    "fx.make_tiled_copy / fx.make_copy_atom / fx.copy_atom_call — tiled copy API",
+    "fx.make_mma_atom / fx.mma_atom_call — MMA/MFMA atom API",
+    "fx.Tensor / fx.Stream / fx.Constexpr / fx.Int32 — argument types",
+    "flydsl.runtime.device.get_rocm_arch() — GPU architecture detection",
+    "kernels.preshuffle_gemm / kernels.layernorm_kernel / kernels.softmax_kernel / kernels.pa_decode_fp8 — pre-built kernels"
+  ]
+}

@@ -1,0 +1,282 @@
+---
+title: "flydsl.autotune — GPU Kernel Autotuning Decorator API"
+description: "Reference for @autotune and Config: benchmark multiple kernel configurations, cache the fastest result, and inject winning parameters into @jit kernels."
+keywords: ["flydsl", "autotune", "Config", "benchmark", "tuning", "GEMM", "performance"]
+---
+
+The `flydsl.autotune` module provides a `@autotune` decorator and a `Config` class for systematically benchmarking a set of kernel configurations and caching the fastest result. It wraps any `@flyc.jit` function, runs all candidate configs against real GPU data on the first call, and replays the winner on every subsequent call with the same key signature.
+
+```python
+from flydsl.autotune import autotune, Config
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+```
+
+---
+
+## `Config` class
+
+A single tuning configuration. Holds user-defined `kwargs` (injected as constexpr kernel arguments), plus compiler-level options.
+
+### Constructor
+
+```python
+Config(
+    *,
+    num_warps: int | None = None,
+    waves_per_eu: int | None = None,
+    maxnreg: int | None = None,
+    pre_hook: Callable | None = None,
+    **kwargs,
+)
+```
+
+<ParamField path="num_warps" type="int | None" default="None">
+  Number of warps per workgroup. Injected into the kernel call as `num_warps`.
+</ParamField>
+
+<ParamField path="waves_per_eu" type="int | None" default="None">
+  Target occupancy waves per execution unit. Passed as a compile hint.
+</ParamField>
+
+<ParamField path="maxnreg" type="int | None" default="None">
+  Maximum VGPR count per thread. Passed as a compile hint.
+</ParamField>
+
+<ParamField path="pre_hook" type="Callable | None" default="None">
+  Called before each benchmark iteration for this config. Receives the merged kwargs dict as its argument. Use to reset accumulators or set up problem-specific state.
+</ParamField>
+
+<ParamField path="**kwargs" type="any">
+  Arbitrary keyword arguments injected into the `@jit` call as constexpr values. Typical examples: `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, `num_stages`.
+</ParamField>
+
+```python
+Config(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4, waves_per_eu=2)
+Config(BLOCK_M=64,  BLOCK_N=256, BLOCK_K=32, num_warps=8, maxnreg=128)
+```
+
+### Methods
+
+#### `all_kwargs() → dict`
+
+Returns all kwargs to inject into the `@jit` call, including `num_warps` if set.
+
+```python
+cfg = Config(BLOCK=128, num_warps=4)
+cfg.all_kwargs()  # {"BLOCK": 128, "num_warps": 4}
+```
+
+#### `compiler_opts() → dict`
+
+Returns compiler-level hints (`waves_per_eu`, `maxnreg`) as a dict. These are passed to `CompilationContext.compile_hints` and affect LLVM/backend code generation, not kernel arguments.
+
+```python
+cfg = Config(waves_per_eu=2, maxnreg=128)
+cfg.compiler_opts()  # {"waves_per_eu": 2, "maxnreg": 128}
+```
+
+#### `to_dict() / from_dict(d)` — serialization
+
+Used by the disk cache. `from_dict` is a classmethod.
+
+---
+
+## `@autotune` decorator
+
+### Signature
+
+```python
+autotune(
+    configs: List[Config],
+    key: List[str] = None,
+    warmup: int = 5,
+    rep: int = 25,
+    prune_configs_by: Callable = None,
+    reset_to_zero: List[str] = None,
+    pre_hook: Callable = None,
+    post_hook: Callable = None,
+    do_bench: Callable = None,
+)
+```
+
+<ParamField path="configs" type="List[Config]" required>
+  All candidate configurations to benchmark.
+</ParamField>
+
+<ParamField path="key" type="List[str]" default="[]">
+  Names of arguments whose values affect the optimal configuration. Used to build the cache key. Include tensor shapes and problem dimensions; exclude data pointers. Example: `key=["M", "N", "K"]`.
+</ParamField>
+
+<ParamField path="warmup" type="int" default="5">
+  Number of warm-up iterations before timing.
+</ParamField>
+
+<ParamField path="rep" type="int" default="25">
+  Number of benchmark repetitions. The median time is used.
+</ParamField>
+
+<ParamField path="prune_configs_by" type="Callable | None" default="None">
+  Optional function `(configs, kwargs_dict) → configs`. Eliminates configs that are provably suboptimal for the given problem (e.g., configs whose block size exceeds the problem dimension).
+</ParamField>
+
+<ParamField path="reset_to_zero" type="List[str] | None" default="None">
+  Names of tensor arguments to zero out before each benchmark iteration. Use for output tensors that accumulate across calls (e.g., the C matrix in GEMM).
+</ParamField>
+
+<ParamField path="pre_hook" type="Callable | None" default="None">
+  Called before every kernel invocation during benchmarking (all configs). Receives the merged kwargs dict.
+</ParamField>
+
+<ParamField path="post_hook" type="Callable | None" default="None">
+  Called after every kernel invocation during benchmarking. Receives the merged kwargs dict.
+</ParamField>
+
+<ParamField path="do_bench" type="Callable | None" default="None">
+  Override the benchmark function. Signature: `(fn, warmup, rep) → float` (milliseconds). Defaults to the built-in `do_bench` using HIP events.
+</ParamField>
+
+---
+
+## How autotuning works
+
+On the first call with a new `key` signature:
+
+1. `prune_configs_by` eliminates obviously inapplicable configs.
+2. For each remaining config, `_bench_one` compiles and benchmarks the kernel using `do_bench` (HIP event timing).
+3. The config with the lowest median time is selected.
+4. The result is written to the in-memory cache and to disk at `~/.flydsl/autotune/<func_name>.json`.
+
+On subsequent calls with the same key:
+
+1. The best config is looked up in the in-memory cache (loaded from disk on startup).
+2. The kernel runs directly with the winning config — no benchmarking overhead.
+
+### Key construction
+
+The cache key combines:
+- Values of arguments named in `key` (shapes extracted from tensors, raw values for scalars)
+- Dtype of all tensor arguments (for type specialization)
+
+```python
+# For key=["M", "N", "K"], a call with M=4096, N=4096, K=2048:
+# key = ("4096", "4096", "2048", "(a:torch.float16, b:torch.float16, c:torch.float32)")
+```
+
+---
+
+## Cache location and invalidation
+
+Results are persisted at:
+
+```
+~/.flydsl/autotune/<func_name>.json
+```
+
+The file is a JSON dictionary mapping serialized key tuples to `Config` dicts. Override the location with the `FLYDSL_AUTOTUNE_CACHE_DIR` environment variable.
+
+<Warning>
+The autotune cache is **not** automatically invalidated when kernel code changes. Delete the JSON file manually after changing kernel logic or when moving to a different GPU.
+</Warning>
+
+---
+
+## Full example
+
+```python
+import torch
+from flydsl.autotune import autotune, Config
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+@autotune(
+    configs=[
+        Config(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4),
+        Config(BLOCK_M=128, BLOCK_N=256, BLOCK_K=32, num_warps=8),
+        Config(BLOCK_M=64,  BLOCK_N=128, BLOCK_K=64, num_warps=4, waves_per_eu=2),
+        Config(BLOCK_M=256, BLOCK_N=64,  BLOCK_K=32, num_warps=4, maxnreg=128),
+    ],
+    key=["M", "N", "K"],
+    warmup=25,
+    rep=100,
+    reset_to_zero=["c"],
+)
+@flyc.jit
+def launch_gemm(
+    c: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    BLOCK_M: fx.Constexpr[int],
+    BLOCK_N: fx.Constexpr[int],
+    BLOCK_K: fx.Constexpr[int],
+    num_warps: fx.Constexpr[int],
+):
+    grid_m = M // BLOCK_M
+    grid_n = N // BLOCK_N
+
+    @flyc.kernel(known_block_size=[num_warps * 64, 1, 1])
+    def gemm_kernel(
+        c: fx.Tensor, a: fx.Tensor, b: fx.Tensor,
+        M: fx.Constexpr[int], N: fx.Constexpr[int], K: fx.Constexpr[int],
+        BM: fx.Constexpr[int], BN: fx.Constexpr[int], BK: fx.Constexpr[int],
+    ):
+        # kernel body...
+        pass
+
+    gemm_kernel(c, a, b, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K).launch(
+        grid=(grid_m, grid_n, 1),
+        block=(num_warps * 64, 1, 1),
+    )
+
+
+# First call triggers benchmarking for this (M, N, K):
+M, N, K = 4096, 4096, 2048
+a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+c = torch.empty(M, N, device="cuda", dtype=torch.float32)
+
+launch_gemm(c, a, b, M, N, K)
+# [autotune] tuning 4 configs...
+#   [1/4] Config(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4) -> 1.234 ms
+#   [2/4] Config(BLOCK_M=128, BLOCK_N=256, BLOCK_K=32, num_warps=8) -> 0.987 ms
+#   ...
+# [autotune] best: Config(BLOCK_M=128, BLOCK_N=256, BLOCK_K=32, num_warps=8) (0.987 ms)
+
+# Subsequent calls use the cached winner immediately:
+launch_gemm(c, a, b, M, N, K)
+```
+
+---
+
+## `do_bench` utility
+
+```python
+from flydsl.autotune import do_bench
+
+ms = do_bench(fn, warmup=5, rep=25)
+```
+
+Benchmarks `fn()` using HIP events. Returns the median time in milliseconds. Pass `quantiles=[0.2, 0.5, 0.8]` to get percentile values instead.
+
+---
+
+## Advanced: custom pruning
+
+Use `prune_configs_by` to skip configs that exceed problem bounds:
+
+```python
+def prune(configs, kwargs):
+    M, N = kwargs.get("M", 0), kwargs.get("N", 0)
+    return [
+        c for c in configs
+        if c.kwargs.get("BLOCK_M", 0) <= M and c.kwargs.get("BLOCK_N", 0) <= N
+    ]
+
+@autotune(configs=configs, key=["M", "N", "K"], prune_configs_by=prune)
+@flyc.jit
+def launch(...):
+    ...
+```

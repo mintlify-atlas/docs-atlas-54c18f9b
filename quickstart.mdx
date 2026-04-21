@@ -1,80 +1,240 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: Your First FlyDSL GPU Kernel on AMD ROCm"
+description: "Write, compile, and launch a vector addition GPU kernel on AMD ROCm using FlyDSL layout algebra, copy atoms, and the @flyc.kernel and @flyc.jit decorators."
+keywords: ["FlyDSL quickstart", "GPU kernel", "vector add", "layout algebra", "flyc.kernel", "flyc.jit", "AMD ROCm"]
 ---
 
-## Get started in three steps
+This guide takes you from a working FlyDSL install to a running GPU kernel. You will write a vector addition kernel using FlyDSL's layout algebra and copy atoms, launch it on an AMD GPU, and verify the result with PyTorch.
 
-Get your documentation site running locally and make your first customization.
+<Note>
+Complete [Installation](/installation) before continuing. You need FlyDSL installed and a ROCm-capable AMD GPU available.
+</Note>
 
-### Step 1: Set up your local environment
+## The full example
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+The file `examples/01-vectorAdd.py` in the repository demonstrates the core FlyDSL programming model end-to-end. Below is the complete kernel and launch function, followed by a section-by-section explanation.
 
-### Step 2: Deploy your changes
+```python
+import torch
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+@flyc.kernel
+def vectorAddKernel(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    block_dim: fx.Constexpr[int],
+):
+    bid = fx.block_idx.x
+    tid = fx.thread_idx.x
 
-### Step 3: Go live
+    A = fx.rocdl.make_buffer_tensor(A)
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    tA = fx.logical_divide(A, fx.make_layout(block_dim, 1))
+    tB = fx.logical_divide(B, fx.make_layout(block_dim, 1))
+    tC = fx.logical_divide(C, fx.make_layout(block_dim, 1))
+
+    tA = fx.slice(tA, (None, bid))
+    tB = fx.slice(tB, (None, bid))
+    tC = fx.slice(tC, (None, bid))
+
+    tA = fx.logical_divide(tA, fx.make_layout(1, 1))
+    tB = fx.logical_divide(tB, fx.make_layout(1, 1))
+    tC = fx.logical_divide(tC, fx.make_layout(1, 1))
+
+    RABMemRefTy = fx.MemRefType.get(
+        fx.T.f32(), fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+    )
+
+    copyAtom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+    copyAtomBuffer = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+    rA = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+    rB = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+    rC = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+
+    fx.copy_atom_call(copyAtomBuffer, fx.slice(tA, (None, tid)), rA)
+    fx.copy_atom_call(copyAtom, fx.slice(tB, (None, tid)), rB)
+
+    vC = fx.arith.addf(fx.memref_load_vec(rA), fx.memref_load_vec(rB))
+    fx.memref_store_vec(vC, rC)
+
+    fx.copy_atom_call(copyAtom, rC, fx.slice(tC, (None, tid)))
+
+
+@flyc.jit
+def vectorAdd(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C,                              # type inferred automatically
+    n: fx.Int32,                    # dynamic int32 (not baked into cache key)
+    const_n: fx.Constexpr[int],    # static int32 (affects JIT cache key)
+    stream: fx.Stream = fx.Stream(None),
+):
+    block_dim = 64
+    grid_x = (n + block_dim - 1) // block_dim
+    vectorAddKernel(A, B, C, block_dim).launch(
+        grid=(grid_x, 1, 1), block=[block_dim, 1, 1], stream=stream
+    )
+```
+
+## Running it
+
+```python
+n = 128
+A = torch.randint(0, 10, (n,), dtype=torch.float32).cuda()
+B = torch.randint(0, 10, (n,), dtype=torch.float32).cuda()
+C = torch.zeros(n, dtype=torch.float32).cuda()
+
+tA = flyc.from_dlpack(A).mark_layout_dynamic(leading_dim=0, divisibility=4)
+vectorAdd(tA, B, C, n, n + 1, stream=torch.cuda.Stream())
+
+torch.cuda.synchronize()
+print("Result correct:", torch.allclose(C, A + B))
+```
+
+You should see:
+
+```
+Result correct: True
+```
+
+Run the full example directly from the repository:
+
+```bash
+cd /path/to/FlyDSL
+PYTHONPATH=. python examples/01-vectorAdd.py
+```
+
+## Understanding the code
+
+### Imports
+
+```python
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+```
+
+`flydsl.compiler` (`flyc`) provides the `@flyc.kernel` and `@flyc.jit` decorators and utilities like `from_dlpack`. `flydsl.expr` (`fx`) is the expression API: layout ops, copy atoms, arithmetic, GPU intrinsics, and memory types.
+
+### `@flyc.kernel` — the GPU kernel
+
+`@flyc.kernel` marks a Python function that will be traced into an MLIR module and compiled to run on the GPU. The function body is executed at trace time, not at call time.
+
+**Type annotations** tell the compiler how to handle each argument:
+
+- `fx.Tensor` — a pointer to GPU memory with layout metadata
+- `fx.Constexpr[int]` — a compile-time constant that is inlined into the kernel and is part of the JIT cache key
+
+Inside the kernel, `fx.block_idx.x` and `fx.thread_idx.x` return the current block and thread indices as MLIR values.
+
+### `fx.rocdl.make_buffer_tensor` — hardware buffer resources
+
+```python
+A = fx.rocdl.make_buffer_tensor(A)
+```
+
+This wraps the tensor in an AMD ROCDL buffer resource descriptor, enabling `BufferCopy32b` — the hardware-accelerated buffer load instruction available on CDNA architectures. Use this for tensors you intend to load via `BufferCopy32b`.
+
+### Layout operations — partitioning tensors
+
+```python
+tA = fx.logical_divide(A, fx.make_layout(block_dim, 1))
+tA = fx.slice(tA, (None, bid))
+tA = fx.logical_divide(tA, fx.make_layout(1, 1))
+```
+
+`fx.logical_divide` partitions a tensor's layout by a given tile layout. The result is a rank-2 tensor where the first dimension indexes elements within a tile and the second dimension indexes tiles. `fx.slice` selects a specific tile — here, the tile corresponding to the current block index `bid`. The second `logical_divide` prepares a per-thread view.
+
+This two-level divide is the standard FlyDSL pattern for mapping global data to blocks and then to threads.
+
+### Copy atoms — typed memory operations
+
+```python
+copyAtom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+copyAtomBuffer = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+```
+
+Copy atoms are typed, hardware-specific copy descriptors. `UniversalCopy32b` is a generic 32-bit copy that works with flat `fx.Tensor` views. `BufferCopy32b` uses the ROCDL buffer load instruction and requires a buffer tensor created with `fx.rocdl.make_buffer_tensor`.
+
+### Register allocation and load/compute/store
+
+```python
+rA = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+rB = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+rC = fx.memref_alloca(RABMemRefTy, fx.make_layout(1, 1))
+
+fx.copy_atom_call(copyAtomBuffer, fx.slice(tA, (None, tid)), rA)
+fx.copy_atom_call(copyAtom,       fx.slice(tB, (None, tid)), rB)
+
+vC = fx.arith.addf(fx.memref_load_vec(rA), fx.memref_load_vec(rB))
+fx.memref_store_vec(vC, rC)
+
+fx.copy_atom_call(copyAtom, rC, fx.slice(tC, (None, tid)))
+```
+
+`fx.memref_alloca` allocates register-space storage. `fx.copy_atom_call` copies from a source to a destination using the specified copy atom. After loading `rA` and `rB`, `fx.arith.addf` emits a floating-point add on the loaded vectors. The result is stored back to `rC` and then written to global memory.
+
+### `@flyc.jit` — the host launch function
+
+`@flyc.jit` marks the host-side function that JIT-compiles and dispatches the kernel. Type annotations here describe the host arguments:
+
+- `fx.Tensor` — a GPU tensor (can also be a raw `torch.Tensor` or DLPack-compatible array)
+- `fx.Int32` — a dynamic 32-bit integer passed at runtime, not baked into the cache key
+- `fx.Constexpr[int]` — a static integer that participates in the JIT cache key; changing it triggers recompilation
+- `fx.Stream` — an optional CUDA/HIP stream for the kernel launch
+
+The grid and block dimensions are computed inside the `@flyc.jit` function and passed to `.launch()`.
+
+### `flyc.from_dlpack` and `mark_layout_dynamic`
+
+```python
+tA = flyc.from_dlpack(A).mark_layout_dynamic(leading_dim=0, divisibility=4)
+```
+
+`flyc.from_dlpack` wraps a DLPack-compatible tensor (such as a `torch.Tensor`) into a FlyDSL `fx.Tensor`. `mark_layout_dynamic` tells the compiler that the leading dimension of `tA` is dynamic at runtime, with a known divisibility hint. This affects how the layout is tracked in the compiled kernel and avoids unnecessarily baking the tensor size into the cache key.
+
+## CUDA Graph capture
+
+The example also demonstrates CUDA Graph capture, which avoids CPU overhead on repeated launches:
+
+```python
+# Warmup to trigger JIT compilation
+vectorAdd(tA, B, C, n, n + 1, stream=torch.cuda.Stream())
+torch.cuda.synchronize()
+
+graph = torch.cuda.CUDAGraph()
+capture_stream = torch.cuda.Stream()
+capture_stream.wait_stream(torch.cuda.current_stream())
+
+with torch.cuda.stream(capture_stream):
+    with torch.cuda.graph(graph, stream=capture_stream):
+        vectorAdd(tA, B, C, n, n + 1, stream=capture_stream)
+
+C.zero_()
+graph.replay()
+torch.cuda.synchronize()
+print("Graph capture correct:", torch.allclose(C, A + B))
+```
+
+FlyDSL's `fly-gpu-stream-inject` pass injects the capture stream into the kernel launch, so no manual TLS patching is required.
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Layout system" icon="table-cells" href="/concepts/layout-system">
+    Learn the full layout algebra: shapes, strides, composition, product, divide, and coordinate mapping.
+  </Card>
+  <Card title="Kernel authoring guide" icon="pen-to-square" href="/guides/kernel-authoring">
+    Write more complex kernels with tiled copy, MFMA atoms, and shared memory.
+  </Card>
+  <Card title="Pre-built kernels" icon="box-archive" href="/kernels/overview">
+    Use production GEMM, LayerNorm, Softmax, and attention kernels without writing them from scratch.
+  </Card>
+  <Card title="Architecture guide" icon="sitemap" href="/concepts/architecture">
+    Understand how Python tracing, MLIR lowering, and kernel caching work under the hood.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

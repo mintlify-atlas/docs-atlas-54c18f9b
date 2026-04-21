@@ -1,0 +1,113 @@
+---
+title: "Pre-built Kernels: Complete Overview and Import Guide"
+description: "All production GPU kernels shipped with FlyDSL — dtypes, GPU architectures, module paths, and links to per-kernel reference pages."
+---
+
+The `kernels/` package ships a collection of production-ready GPU kernels for AMD ROCm hardware. Each kernel is implemented using the `@flyc.kernel` / `@flyc.jit` API from `flydsl.compiler` and can be imported directly into your Python code with no build step beyond installing FlyDSL itself. The kernels target CDNA3 (MI300X, gfx942), CDNA4 (MI350/MI355X, gfx950), RDNA4 (gfx1201), and gfx1250 (MI450) GPU families.
+
+## Available kernels
+
+| Kernel | Module path | Builder / entry point | Dtypes | GPU arch |
+|---|---|---|---|---|
+| Preshuffle GEMM | `kernels.preshuffle_gemm` | `compile_preshuffle_gemm_a8` | fp8, int8, int4, fp16, bf16, fp4 | gfx942, gfx950 |
+| Blockscale GEMM | `kernels.blockscale_preshuffle_gemm` | see module | fp8, bf16 | gfx950 |
+| HGEMM Split-K | `kernels.hgemm_splitk` | `compile_hgemm_kernel` | f16, bf16 | gfx942, gfx950 |
+| RDNA FP16 GEMM | `kernels.rdna_f16_gemm` | see module | f16, fp8 | gfx1201 |
+| MoE GEMM 2-stage | `kernels.moe_gemm_2stage` | see module | fp8, f16, bf16, int8, int4 | gfx942, gfx950 |
+| MoE Blockscale 2-stage | `kernels.moe_blockscale_2stage` | see module | fp8, bf16 | gfx950 |
+| LayerNorm | `kernels.layernorm_kernel` | `build_layernorm_module` | f32, f16, bf16 | gfx942, gfx950+ |
+| RMSNorm | `kernels.rmsnorm_kernel` | `build_rmsnorm_module` | f32, f16, bf16 | gfx942, gfx950+ |
+| Softmax | `kernels.softmax_kernel` | `build_softmax_module` | f32, f16, bf16 | gfx942, gfx950+ |
+| FlashAttention | `kernels.flash_attn_func` | `build_flash_attn_func_module_primary` | f16, bf16 | gfx942, gfx950 |
+| PagedAttention decode | `kernels.pa_decode_fp8` | `build_pa_decode_module` | fp8 KV / bf16 output | gfx942, gfx950 |
+| Fused RoPE + KV cache | `kernels.fused_rope_cache_kernel` | `build_fused_rope_cache_module` | bf16, f16 | gfx942, gfx950+ |
+| AllReduce | `kernels.custom_all_reduce` | `init_custom_ar` | f16, bf16 | multi-GPU |
+
+<Note>
+  The `kernels/` directory is a Python package. All imports use the `kernels.` prefix, for example `from kernels.layernorm_kernel import build_layernorm_module`. Run with `PYTHONPATH=./` when invoking from the repository root without an editable install.
+</Note>
+
+## How to import and use
+
+Every kernel follows a two-step pattern: build a launcher (JIT compile), then call it with PyTorch tensors.
+
+```python
+import torch
+from kernels.layernorm_kernel import build_layernorm_module
+
+# Step 1: build the launcher (compiled on first call)
+launcher = build_layernorm_module(M=32768, N=8192, dtype_str="bf16")
+
+# Step 2: prepare inputs
+x      = torch.randn(32768, 8192, dtype=torch.bfloat16, device="cuda")
+gamma  = torch.ones(8192,        dtype=torch.bfloat16, device="cuda")
+beta   = torch.zeros(8192,       dtype=torch.bfloat16, device="cuda")
+output = torch.empty_like(x)
+
+# Step 3: call the launcher
+m_in = torch.tensor(32768, dtype=torch.int32)
+launcher(x, gamma, beta, output, m_in)
+torch.cuda.synchronize()
+```
+
+The pattern is the same for every normalization and GEMM kernel — call the builder once per shape/dtype configuration, reuse the returned launcher across calls.
+
+### Preshuffle GEMM quick start
+
+```python
+from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+
+launch_fn = compile_preshuffle_gemm_a8(
+    M=0, N=5120, K=8192,
+    tile_m=16, tile_n=128, tile_k=256,
+    in_dtype="fp8",
+    lds_stage=2,
+)
+
+# launch_fn(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, M, N, stream)
+```
+
+## Choosing the right kernel
+
+Use this decision tree to select the appropriate kernel for your workload.
+
+```
+What operation?
+│
+├── Matrix multiply (GEMM)
+│   ├── FP8 / INT8 / INT4 / FP16 / BF16 / FP4  → preshuffle_gemm
+│   ├── FP16 or BF16 with split-K reduction     → hgemm_splitk
+│   └── Mixture of Experts (gate+up+reduce)     → moe_gemm_2stage / moe_blockscale_2stage
+│
+├── Normalization
+│   ├── With learnable bias (beta)  → layernorm_kernel
+│   └── No bias term                → rmsnorm_kernel
+│
+├── Softmax (row-wise)  → softmax_kernel
+│
+├── Attention
+│   ├── Full-sequence forward pass  → flash_attn_func   (WIP: perf tuning)
+│   └── Decode with paged KV cache  → pa_decode_fp8     (WIP: perf tuning)
+│
+└── Auxiliary
+    ├── Fused RoPE + KV cache write  → fused_rope_cache_kernel
+    └── Multi-GPU sum reduction      → custom_all_reduce
+```
+
+## Kernel pages
+
+<CardGroup cols={2}>
+  <Card title="GEMM Kernels" href="/kernels/gemm">
+    Preshuffle GEMM, blockscale GEMM, HGEMM split-K, RDNA GEMM, and MoE GEMM — pipeline details, dtype support, and configuration.
+  </Card>
+  <Card title="Normalization & Softmax" href="/kernels/normalization">
+    LayerNorm, RMSNorm, and Softmax kernel builders — configuration tables, algorithm details, and code examples.
+  </Card>
+  <Card title="Attention & Misc" href="/kernels/attention-and-misc">
+    PagedAttention FP8 decode, FlashAttention, fused RoPE + KV cache, and multi-GPU AllReduce.
+  </Card>
+</CardGroup>
+
+## Shared utilities
+
+All normalization and attention kernels share helper code in `kernels/kernels_common.py` (warp and block reductions), `kernels/mfma_epilogues.py` (MFMA output strategies), and `kernels/mfma_preshuffle_pipeline.py` (preshuffle data movement and layout helpers). You generally do not need to import these directly — they are used internally by the builders.

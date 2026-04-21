@@ -1,0 +1,319 @@
+---
+title: "Attention, Fused RoPE, and AllReduce Kernel Reference"
+description: "FlyDSL PagedAttention FP8 decode, FlashAttention, fused RoPE + KV cache, and multi-GPU AllReduce — signatures, WIP status, and usage examples."
+---
+
+This page covers the attention and auxiliary kernels shipped in the `kernels/` package: **PagedAttention FP8 decode**, **FlashAttention**, **Fused RoPE + KV cache**, and **AllReduce**. The attention kernels are functional and tested, but performance tuning is still ongoing — see the WIP notes for each kernel.
+
+<Warning>
+  Both PagedAttention (`pa_decode_fp8`) and FlashAttention (`flash_attn_func`) are marked as **WIP: performance tuning in progress** in the FlyDSL README. They pass correctness tests but have not yet reached peak hardware throughput. Verify with `PYTHONPATH=./ pytest tests/kernels/test_pa.py` and `tests/kernels/test_flash_attn_func.py` on your target GPU.
+</Warning>
+
+---
+
+## PagedAttention FP8 decode (`kernels/pa_decode_fp8.py`)
+
+The paged attention decode kernel implements multi-head attention for inference-time decoding against a paged KV cache. Keys and values are stored in FP8 format; outputs are written in BF16. The implementation uses MFMA 16×16×32 FP8 instructions and an online softmax pipeline.
+
+### Constants
+
+| Constant | Value | Description |
+|---|---|---|
+| `QUERY_GROUP_SIZE` | 16 | Query heads per KV head (GQA group size) |
+| `HEAD_SIZE` | 128 | Attention head dimension |
+| `KV_BLOCK_SIZE` | 16 | Default tokens per paged KV block |
+| `KV_COMPUTE_BLOCK` | 256 | Tokens processed per GEMM tile |
+| `NUM_WARPS` | 4 | Wavefronts per thread block |
+| `WARP_SIZE` | 64 | AMD wavefront size |
+
+### Builder function
+
+```python
+from kernels.pa_decode_fp8 import build_pa_decode_module
+
+kernel_fn = build_pa_decode_module(
+    num_seqs=1,
+    num_kv_heads=8,
+    num_partitions=4,
+    max_blocks_per_seq=256,
+    softmax_scale=None,       # defaults to 1 / sqrt(HEAD_SIZE)
+    query_scale=1.0,
+    key_scale=1.0,
+    value_scale=1.0,
+    kv_block_size=16,         # 16 (standard) or 1024 (large block; requires trans_v=True)
+    trans_v=False,
+    one_shot=False,
+    ps_num_splits=0,
+)
+```
+
+`build_pa_decode_module` returns the raw `@flyc.kernel` function. For the complete two-kernel (decode + reduce) pipeline, also build the reduce kernel:
+
+```python
+from kernels.pa_decode_fp8 import build_ps_reduce_kernel, build_v2_reduce_kernel
+
+# Fixed partition count reduce
+ps_kernel, ps_launch = build_ps_reduce_kernel(
+    head_size=128,
+    query_group_size=16,
+    query_seq_len=1,
+    max_context_partition_num=4,
+)
+
+# Dynamic partition count reduce
+v2_kernel, v2_launch = build_v2_reduce_kernel(
+    head_size=128,
+    query_group_size=16,
+    query_seq_len=1,
+    context_partition_size=256,
+)
+```
+
+### Decode kernel signature
+
+```python
+pa_decode_dot_kernel(
+    out_ptr,           # [num_seqs, num_kv_heads, num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE] bf16
+    exp_sums_ptr,      # [num_seqs, num_kv_heads, num_partitions, QUERY_GROUP_SIZE] f32
+    max_logits_ptr,    # [num_seqs, num_kv_heads, num_partitions, QUERY_GROUP_SIZE] f32
+    query_ptr,         # [num_seqs, num_kv_heads*QUERY_GROUP_SIZE, HEAD_SIZE] fp8
+    key_cache_ptr,     # paged key cache, fp8
+    value_cache_ptr,   # paged value cache, fp8
+    block_tables_ptr,  # [num_seqs, max_blocks_per_seq] int32
+    context_length_i32,# scalar int32
+)
+```
+
+### Supported GPU
+
+The decode kernel requires MFMA 16×16×32 FP8 instructions — available on **gfx942 (MI300X)** and **gfx950 (MI350/MI355X)**. Running on other architectures will fail at compile time.
+
+### KV block size variants
+
+| `kv_block_size` | `trans_v` | Description |
+|---|---|---|
+| `16` | `False` | Standard paged KV; 16 tokens per page |
+| `1024` | `True` | Large block (contiguous sequence segments); V transposed in memory |
+
+### Online softmax pipeline
+
+The decode kernel maintains a running `(max_logit, exp_sum)` pair across KV partitions without materializing the full attention score matrix. At each partition:
+
+1. Load Q from global memory to LDS with XOR swizzle.
+2. Load K tiles from paged cache via buffer resource.
+3. Compute QK MFMA accumulation (4 tiles × 4 K-chunks).
+4. Update running max and rescale previous accumulator.
+5. Pack softmax probabilities to FP8 and write to LDS.
+6. Load V tiles, compute PV MFMA accumulation.
+7. On the last partition, write scaled BF16 output.
+
+---
+
+## FlashAttention (`kernels/flash_attn_func.py`)
+
+The FlashAttention kernel implements the full forward pass using the MFMA 32×32 register layout. It supports causal masking and handles arbitrary batch sizes and sequence lengths.
+
+### Builder function
+
+```python
+from kernels.flash_attn_func import build_flash_attn_func_module_primary
+
+launcher = build_flash_attn_func_module_primary(
+    num_heads=32,
+    head_dim=128,
+    causal=True,
+    dtype_str="bf16",         # "f16" or "bf16"
+    sm_scale=None,            # defaults to 1 / sqrt(head_dim)
+    waves_per_eu=2,
+    block_m=None,             # None = auto-select 128 or 256 based on workload size
+)
+```
+
+### Launch signature
+
+```python
+launcher(Q, K, V, O, batch_size, seq_len, stream=None)
+```
+
+| Argument | Shape | Description |
+|---|---|---|
+| `Q` | `[B*S, H, D]` flattened | Query tensor |
+| `K` | `[B*S, H, D]` flattened | Key tensor |
+| `V` | `[B*S, H, D]` flattened | Value tensor |
+| `O` | `[B*S, H, D]` flattened | Output tensor |
+| `batch_size` | `int32` | Batch size B |
+| `seq_len` | `int32` | Sequence length S |
+
+Tensors must be 1-D flattened from `[batch, seq_len, num_heads, head_dim]` (BSHD layout).
+
+### Supported dtypes and constraints
+
+| `dtype_str` | MFMA instruction (gfx942) | MFMA instruction (gfx950) |
+|---|---|---|
+| `"f16"` | `mfma_f32_32x32x8f16` | `mfma_f32_32x32x16_f16` |
+| `"bf16"` | `mfma_f32_32x32x8bf16_1k` | `mfma_f32_32x32x16_bf16` |
+
+Requirements:
+- `head_dim % 32 == 0` and `head_dim >= 64`
+- `seq_len % 128 == 0`
+
+### Block size selection
+
+When `block_m=None` and `num_heads >= 32`, the builder automatically creates both `BLOCK_M=128` (256 threads) and `BLOCK_M=256` (512 threads) variants and dispatches at runtime based on `B * S * num_heads` vs. a threshold of `4096 * num_heads`.
+
+### K/V LDS pipeline
+
+K tiles are stored in LDS with an XOR16 swizzle (`col ^ ((row & 7) << 4)`) at 16-element granularity to avoid bank conflicts. On gfx950, `ds_read_tr16_b64` hardware transpose reads are used for V tiles (read V in row-major, MFMA receives transposed layout automatically). On gfx942, V is stored transposed in LDS.
+
+### Code example
+
+```python
+import torch
+from kernels.flash_attn_func import build_flash_attn_func_module_primary
+
+B, S, H, D = 2, 1024, 32, 128
+
+launcher = build_flash_attn_func_module_primary(
+    num_heads=H,
+    head_dim=D,
+    causal=True,
+    dtype_str="bf16",
+)
+
+# Flatten BSHD -> (B*S, H, D) then to 1-D
+def flatten(t):
+    return t.contiguous().view(-1)
+
+Q = flatten(torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda"))
+K = flatten(torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda"))
+V = flatten(torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda"))
+O = torch.empty_like(Q)
+
+launcher(Q, K, V, O, B, S)
+torch.cuda.synchronize()
+```
+
+---
+
+## Fused RoPE + KV cache (`kernels/fused_rope_cache_kernel.py`)
+
+The fused RoPE kernel applies Rotary Position Embedding to Q and K, then writes the rotated K and V directly into a paged KV cache — all in a single kernel launch pair (one kernel for Q RoPE, one for K RoPE + KV cache write).
+
+### Builder function
+
+```python
+from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+
+launcher = build_fused_rope_cache_module(
+    head_dim=128,
+    rotary_dim=-1,       # -1 = full rotation (== head_dim)
+    num_q_heads=32,
+    num_kv_heads=8,
+    block_size=16,
+    is_neox=True,        # NeoX-style RoPE (GPT-NeoX / LLaMA)
+    flash_layout=True,   # True = [num_blocks, block_size, KH, D] cache layout
+    dtype_str="bf16",    # "bf16" or "f16"
+)
+```
+
+<Note>
+  Only NeoX-style rotation (`is_neox=True`) and full-dimension rotation (`rotary_dim == head_dim`) are currently supported. Partial rotation raises `NotImplementedError`.
+</Note>
+
+### Launch signature
+
+```python
+launcher(Q, K, V, Positions, CosCache, SinCache, SlotMapping,
+         KeyCache, ValueCache, Q_out, K_out, num_tokens, stream=None)
+```
+
+| Argument | Shape | Description |
+|---|---|---|
+| `Q` | `[T, QH, D]` | Query input |
+| `K` | `[T, KH, D]` | Key input |
+| `V` | `[T, KH, D]` | Value input |
+| `Positions` | `[T]` int32 | Token position indices into cos/sin cache |
+| `CosCache` | `[max_pos, D//2]` | Precomputed cos values |
+| `SinCache` | `[max_pos, D//2]` | Precomputed sin values |
+| `SlotMapping` | `[T]` int32 | Maps each token to a paged KV slot |
+| `KeyCache` | paged cache tensor | Paged key cache (flash or ATOM layout) |
+| `ValueCache` | paged cache tensor | Paged value cache |
+| `Q_out` | `[T, QH, D]` | Rotated query output |
+| `K_out` | `[T, KH, D]` | Rotated key output |
+| `num_tokens` | int32 | Number of tokens T |
+
+### KV cache layouts
+
+| `flash_layout` | KeyCache shape | ValueCache shape |
+|---|---|---|
+| `True` | `[num_blocks, block_size, KH, D]` | `[num_blocks, block_size, KH, D]` |
+| `False` (ATOM) | `[num_blocks, KH, D//16, block_size, 16]` | `[num_blocks, KH, D, block_size]` |
+
+---
+
+## AllReduce (`kernels/custom_all_reduce.py`)
+
+The AllReduce module provides a multi-GPU sum reduction with a FlyDSL-generated kernel as the backend. It is designed for use in tensor-parallel transformer inference across 2, 4, or 8 GPUs.
+
+### Initialization
+
+```python
+from kernels.custom_all_reduce import init_custom_ar
+
+# torch.distributed must be initialized before calling init_custom_ar
+import torch.distributed as dist
+dist.init_process_group(backend="nccl")
+
+ar_handle = init_custom_ar(
+    meta=None,
+    rank_data=rank_data_tensor,  # device tensor for rank identification
+    handles=shm_handles,         # list of shared memory handles (one per GPU)
+    offsets=byte_offsets,        # list of byte offsets into each handle
+    rank=local_rank,
+    full_nvlink=True,
+    max_size=128 * 1024 * 1024,  # 128 MB max tensor size
+)
+```
+
+`init_custom_ar` returns an `AllreduceHandle` object. The backend can be overridden with the environment variable `FLYDSL_AITER_IMPL`:
+
+| `FLYDSL_AITER_IMPL` | Backend |
+|---|---|
+| `"flydsl"` (default) | FlyDSL kernel |
+| `"aiter"` | aiter package (must be installed separately) |
+
+### Performing allreduce
+
+```python
+# In-place sum reduction across all ranks
+ar_handle.all_reduce(tensor)  # check module for exact method signature
+```
+
+### Supported world sizes
+
+`init_custom_ar` accepts `world_size` of **2, 4, or 8**. Other values raise `ValueError`.
+
+---
+
+## Testing attention and auxiliary kernels
+
+```bash
+# PagedAttention decode
+PYTHONPATH=./ pytest tests/kernels/test_pa.py
+
+# FlashAttention
+PYTHONPATH=./ pytest tests/kernels/test_flash_attn_func.py
+
+# Fused RoPE + KV cache
+PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py
+
+# AllReduce (requires multi-GPU setup)
+PYTHONPATH=./ pytest tests/kernels/test_allreduce.py
+
+# Run with iteration count for performance measurement
+PYTHONPATH=./ python tests/kernels/test_pa.py --num_iters 50
+```
+
+<Tip>
+  Use `FLYDSL_DUMP_IR=1` to dump MLIR IR at every compilation stage. This also disables the disk cache — useful when modifying kernel source.
+</Tip>

@@ -1,0 +1,275 @@
+---
+title: "Normalization Kernels: LayerNorm, RMSNorm, and Softmax"
+description: "FlyDSL LayerNorm, RMSNorm, and Softmax builder APIs — configuration constants, two-pass and online algorithms, vectorized fast paths, and code examples."
+---
+
+FlyDSL ships three row-wise normalization kernels: **LayerNorm**, **RMSNorm**, and **Softmax**. All three are implemented with the Layout API (`@flyc.kernel` / `@flyc.jit`) from `flydsl.compiler`, use AMD wavefront-64 XOR-shuffle reductions, and share configuration constants from `kernels/kernels_common.py`. Each kernel builder returns a `@flyc.jit` launcher that auto-compiles on first call and caches the result.
+
+## Quick reference
+
+| Kernel | Builder | Formula | Dtypes | Fast path |
+|---|---|---|---|---|
+| LayerNorm | `build_layernorm_module(M, N, dtype_str)` | `(x - mean) / sqrt(var + eps) * γ + β` | f32, f16, bf16 | `N == 256 * 8 * 4 = 8192` |
+| RMSNorm | `build_rmsnorm_module(M, N, dtype_str)` | `x / sqrt(mean(x²) + eps) * γ` | f32, f16, bf16 | `N % (256 * 8) == 0` |
+| Softmax | `build_softmax_module(M, N, dtype_str)` | `exp(xᵢ - max(x)) / Σexp(x - max(x))` | f32, f16, bf16 | scalar path (generic) |
+
+---
+
+## Shared configuration constants
+
+All three kernels share the following constants, defined in `kernels/kernels_common.py` and the individual kernel files:
+
+| Constant | Value | Description |
+|---|---|---|
+| `BLOCK_THREADS` | 256 | Threads per block (1 block per row) |
+| `WARP_SIZE` | 64 | AMD wavefront size |
+| `VEC_WIDTH` | 8 | Vector load/store width (elements per vector) |
+| `VEC_ALIGN` | 16 | Alignment for vector operations (bytes) |
+| `EPS` | 1e-5 | Numerical stability epsilon |
+
+The reduction uses XOR-shuffle within each wavefront (shifts 32, 16, 8, 4, 2, 1), then LDS-based cross-wavefront synchronization through `RED_SLOTS = ceil(BLOCK_THREADS / WARP_SIZE) = 4` shared-memory slots.
+
+---
+
+## LayerNorm (`kernels/layernorm_kernel.py`)
+
+LayerNorm computes `LayerNorm(x) = (x - mean) / sqrt(var + eps) * gamma + beta` independently for each row of a 2-D input matrix.
+
+### Builder
+
+```python
+from kernels.layernorm_kernel import build_layernorm_module
+
+launcher = build_layernorm_module(M=32768, N=8192, dtype_str="bf16")
+```
+
+`M` is the number of rows; `N` is the number of columns (hidden dimension). `dtype_str` accepts `"f32"`, `"f16"`, or `"bf16"`.
+
+### Launch signature
+
+```python
+launcher(Input, Gamma, Beta, Output, m_in, stream=None)
+```
+
+| Argument | Shape | Dtype | Description |
+|---|---|---|---|
+| `Input` | `[M, N]` | dtype | Input matrix |
+| `Gamma` | `[N]` | dtype | Learnable scale |
+| `Beta` | `[N]` | dtype | Learnable shift |
+| `Output` | `[M, N]` | dtype | Output matrix (same shape as Input) |
+| `m_in` | scalar `int32` | int32 | Actual number of rows to process |
+
+### Algorithm: two-pass normalization
+
+The kernel dispatches one block per row, with `BLOCK_THREADS = 256` threads:
+
+**Fast path** (`N == BLOCK_THREADS * VEC_WIDTH * 4 = 8192` and elem_bits ≤ 16):
+
+<Steps>
+  <Step title="Load and accumulate (pass 1)">
+    Each thread loads 4 vectorized tiles of `VEC_WIDTH = 8` elements. The entire row fits in registers. Per-thread partial sums (sum and sum-of-squares) are computed over `VEC_WIDTH`-wide vectors using vector reduction ops.
+  </Step>
+  <Step title="Block-wide reduction">
+    XOR-shuffle intra-wavefront reduction → lane 0 writes partial to LDS → wave 0 reduces across all 4 wavefronts → result broadcast via LDS.
+  </Step>
+  <Step title="Compute mean and reciprocal std-dev">
+    `mean = sum / N`, `var = sumsq / N - mean²`, `rstd = rsqrt(max(var, 0) + eps)`.
+  </Step>
+  <Step title="Normalize and store (pass 2)">
+    Apply affine transform `y = (x - mean) * rstd * gamma + beta`. Gamma and beta are pipelined: the next tile's weights are prefetched while the current tile is being stored. For bf16 output on gfx950+, hardware `cvt_pk_bf16_f32` is used; on gfx942, software round-to-nearest-even (RNE) packing is applied.
+  </Step>
+</Steps>
+
+**Generic path** (arbitrary N): A scalar two-pass implementation using `copy_atom_call` loads with out-of-bounds masking. Used when N does not satisfy the fast-path condition.
+
+### Configuration table
+
+| Constant | Value | Description |
+|---|---|---|
+| `BLOCK_THREADS` | 256 | Threads per block |
+| `WARP_SIZE` | 64 | AMD wavefront size |
+| `VEC_WIDTH` | 8 | Elements per vector load/store |
+| `VEC_ALIGN` | 16 | Vector alignment (bytes) |
+| `EPS` | 1e-5 | Stability epsilon |
+| `USE_NONTEMPORAL` | True | Non-temporal stores for the output |
+
+### Code example
+
+```python
+import torch
+from kernels.layernorm_kernel import build_layernorm_module
+
+M, N = 32768, 8192
+launcher = build_layernorm_module(M=M, N=N, dtype_str="bf16")
+
+x      = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+gamma  = torch.ones(N,     dtype=torch.bfloat16, device="cuda")
+beta   = torch.zeros(N,    dtype=torch.bfloat16, device="cuda")
+output = torch.empty_like(x)
+m_in   = torch.tensor(M, dtype=torch.int32)
+
+launcher(x, gamma, beta, output, m_in)
+torch.cuda.synchronize()
+```
+
+---
+
+## RMSNorm (`kernels/rmsnorm_kernel.py`)
+
+RMSNorm computes `RMSNorm(x) = x / sqrt(mean(x²) + eps) * gamma` — a simplified normalization that omits the mean-subtraction step (no `beta` term).
+
+### Builder
+
+```python
+from kernels.rmsnorm_kernel import build_rmsnorm_module
+
+launcher = build_rmsnorm_module(M=32768, N=8192, dtype_str="bf16")
+```
+
+### Launch signature
+
+```python
+launcher(Input, Gamma, Output, m_in, stream=None)
+```
+
+| Argument | Shape | Description |
+|---|---|---|
+| `Input` | `[M, N]` | Input matrix |
+| `Gamma` | `[N]` | Learnable scale |
+| `Output` | `[M, N]` | Output matrix |
+| `m_in` | scalar `int32` | Number of rows to process |
+
+### Algorithm: two-pass with register caching
+
+**Fast path** (`N % (BLOCK_THREADS * VEC_WIDTH) == 0` and elem_bits ≤ 16):
+
+<Steps>
+  <Step title="Load and cache all tiles (pass 1)">
+    Each thread loads all `num_tiles = N / (BLOCK_THREADS * VEC_WIDTH)` tiles into a register list `in_local`. Simultaneously computes the per-thread sum-of-squares.
+  </Step>
+  <Step title="Block reduction for mean-of-squares">
+    Dual XOR-shuffle + LDS reduction to compute the global sum-of-squares. `rrms = rsqrt(mean_sq + eps)`.
+  </Step>
+  <Step title="Normalize, scale, and store (pass 2)">
+    Loads gamma tile-by-tile, multiplies the cached input vectors: `y = (x * rrms) * gamma`, then stores. bf16 RNE packing is applied the same way as LayerNorm.
+  </Step>
+</Steps>
+
+**Generic path** (arbitrary N): Scalar single-pass sum-of-squares followed by scalar normalization with out-of-bounds masking.
+
+### Configuration table
+
+| Constant | Value | Description |
+|---|---|---|
+| `BLOCK_THREADS` | 256 | Threads per block |
+| `WARP_SIZE` | 64 | AMD wavefront size |
+| `VEC_WIDTH` | 8 | Elements per vector load/store |
+| `EPS` | 1e-5 | Stability epsilon |
+
+### Code example
+
+```python
+import torch
+from kernels.rmsnorm_kernel import build_rmsnorm_module
+
+M, N = 32768, 8192
+launcher = build_rmsnorm_module(M=M, N=N, dtype_str="bf16")
+
+x      = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+gamma  = torch.ones(N,     dtype=torch.bfloat16, device="cuda")
+output = torch.empty_like(x)
+m_in   = torch.tensor(M, dtype=torch.int32)
+
+launcher(x, gamma, output, m_in)
+torch.cuda.synchronize()
+```
+
+---
+
+## Softmax (`kernels/softmax_kernel.py`)
+
+The Softmax kernel computes row-wise softmax: `softmax(x)ᵢ = exp(xᵢ - max(x)) / Σⱼ exp(xⱼ - max(x))`. It uses `exp2(x * log2e)` for fast hardware exponentiation, and numerically stabilizes by subtracting the row maximum before exponentiation.
+
+### Builder
+
+```python
+from kernels.softmax_kernel import build_softmax_module
+
+launcher = build_softmax_module(M=32768, N=8192, dtype_str="bf16")
+```
+
+### Launch signature
+
+```python
+launcher(A, C, m_in, stream=None)
+```
+
+| Argument | Shape | Description |
+|---|---|---|
+| `A` | `[M, N]` | Input logits |
+| `C` | `[M, N]` | Output probabilities |
+| `m_in` | scalar `int32` | Number of rows to process |
+
+### Configuration
+
+| Parameter | Value | Description |
+|---|---|---|
+| `BLOCK_THREADS` | 256 | Threads per block |
+| `WARP_SIZE` | 64 | AMD wavefront size |
+| `VEC_WIDTH` | 8 | Vector load/store width |
+
+### Algorithm: online softmax (6 stages)
+
+<Steps>
+  <Step title="Load and find local max">
+    Each thread loads its portion of the row into a register buffer. Out-of-bounds elements are masked to `-inf`. Per-element local max is computed.
+  </Step>
+  <Step title="Global max reduction">
+    Block-wide XOR-shuffle + LDS reduction to find the global row maximum.
+  </Step>
+  <Step title="Compute exp and local sum">
+    For each element: `exp_val = exp2((x - global_max) * log2e)`. Out-of-bounds contributions are zeroed for the sum.
+  </Step>
+  <Step title="Global sum reduction">
+    Block-wide reduction to compute the total `Σ exp(xᵢ - max)`.
+  </Step>
+  <Step title="Normalize and store">
+    Multiply each exp value by `1 / global_sum`, truncate to output dtype, and store. Out-of-bounds columns are skipped.
+  </Step>
+</Steps>
+
+### Code example
+
+```python
+import torch
+from kernels.softmax_kernel import build_softmax_module
+
+M, N = 32768, 8192
+launcher = build_softmax_module(M=M, N=N, dtype_str="bf16")
+
+logits = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+output = torch.empty_like(logits)
+m_in   = torch.tensor(M, dtype=torch.int32)
+
+launcher(logits, output, m_in)
+torch.cuda.synchronize()
+```
+
+---
+
+## Testing
+
+```bash
+# LayerNorm
+PYTHONPATH=./ pytest tests/kernels/test_layernorm.py
+
+# RMSNorm
+PYTHONPATH=./ pytest tests/kernels/test_rmsnorm.py
+
+# Softmax
+PYTHONPATH=./ pytest tests/kernels/test_softmax.py
+```
+
+<Tip>
+  To inspect the generated MLIR at each compiler stage, set `FLYDSL_DUMP_IR=1`. This also disables the disk cache, which is useful during kernel development.
+</Tip>

@@ -1,0 +1,241 @@
+---
+title: "flydsl.runtime & flydsl.utils — Device and Environment API"
+description: "Reference for FlyDSL runtime utilities: GPU arch detection, RDNA/CDNA classification, environment variable management, and shared-memory allocation."
+keywords: ["flydsl", "runtime", "device", "ROCm", "gfx942", "gfx950", "environment", "smem"]
+---
+
+The `flydsl.runtime` and `flydsl.utils` packages provide the infrastructure layer beneath the compiler: GPU architecture detection, environment variable management, shared-memory allocation, and logging. These are used internally by the compiler but are also part of the public API for kernels that need runtime information at Python level.
+
+---
+
+## `flydsl.runtime.device`
+
+### `get_rocm_arch() → str`
+
+Returns the GPU architecture string for the first detected ROCm device, such as `"gfx942"` or `"gfx950"`. The result is cached after the first call.
+
+**Detection order:**
+
+1. `FLYDSL_GPU_ARCH` environment variable (if set)
+2. `HSA_OVERRIDE_GFX_VERSION` environment variable (dotted form `major.minor.step` is converted to `gfxXXX`)
+3. `rocm_agent_enumerator -name` subprocess (first non-`gfx000` line)
+4. Fallback default: `"gfx942"` (MI300X)
+
+```python
+from flydsl.runtime.device import get_rocm_arch
+
+arch = get_rocm_arch()  # e.g. "gfx942", "gfx950", "gfx1201", "gfx1250"
+```
+
+<Note>
+`FLYDSL_ROCM_AGENT_TIMEOUT` controls the subprocess timeout in seconds (default `300`). Reduce it in CI environments where no GPU is present to avoid slow timeouts.
+</Note>
+
+### Supported architecture strings
+
+| String | Chip | Series | Wave size |
+|---|---|---|---|
+| `gfx942` | MI300X | CDNA3 | 64 |
+| `gfx950` | MI350 / MI355X | CDNA4 | 64 |
+| `gfx1201` | Radeon AI PRO R9700 | RDNA4 | 32 |
+| `gfx1250` | MI450 | gfx1250 | 32 |
+
+### `get_rocm_device_count() → int`
+
+Returns the number of ROCm GPU agents reported by `rocm_agent_enumerator`. Returns `0` when the tool is unavailable or no discrete GPU agents are found. Result is cached.
+
+```python
+from flydsl.runtime.device import get_rocm_device_count
+
+n = get_rocm_device_count()  # 0 on CPU-only hosts
+```
+
+### `is_rdna_arch(arch=None) → bool`
+
+Returns `True` when the architecture is RDNA-based (wave32, different buffer descriptor flags).
+
+<ParamField path="arch" type="str | None" default="None">
+  Architecture string to test. If `None`, auto-detects via `get_rocm_arch()`.
+</ParamField>
+
+**RDNA classification rules:**
+- `gfx10xx` → RDNA 1/2
+- `gfx11xx` → RDNA 3
+- `gfx120x` → RDNA 4 / gfx1250
+
+```python
+from flydsl.runtime.device import is_rdna_arch
+
+if is_rdna_arch():
+    # Use WMMA / wave32 code path
+    mma_op = fx.rocdl.WMMA(16, 16, 16, fx.Float16)
+else:
+    # Use MFMA / wave64 code path
+    mma_op = fx.rocdl.MFMA(16, 16, 16, fx.Float16)
+```
+
+---
+
+## `flydsl.utils.env`
+
+`env.py` defines the `EnvManager` system — a metaclass-driven framework for typed, documented environment variable access. Three pre-built managers are exported as module-level singletons.
+
+### `EnvManager` base class
+
+Subclass `EnvManager` to define a group of related environment variables. The metaclass automatically generates `env_var` names by uppercasing the attribute name and prepending the prefix chain.
+
+```python
+from flydsl.utils.env import EnvManager, OptBool, OptInt, OptStr
+
+class MyOptions(EnvManager):
+    env_prefix = "MYAPP"
+
+    debug = OptBool(False, description="Enable debug mode")
+    workers = OptInt(4, min_value=1, max_value=64, description="Worker count")
+    backend = OptStr("cuda", choices=["cuda", "rocm"], description="Backend")
+```
+
+`MYAPP_DEBUG`, `MYAPP_WORKERS`, and `MYAPP_BACKEND` are the resulting variable names.
+
+### Option descriptor types
+
+| Class | Parses as | Notes |
+|---|---|---|
+| `OptBool(default)` | `bool` | Truthy values: `1`, `true`, `yes`, `on` |
+| `OptInt(default, min_value, max_value)` | `int` | Validates range |
+| `OptStr(default, choices)` | `str` | Validates against choices list |
+| `OptList(default, separator, element_type)` | `list` | Comma-separated by default |
+
+### Pre-built singleton managers
+
+All three are importable from `flydsl.utils.env`:
+
+```python
+from flydsl.utils import env
+
+env.compile   # CompileEnvManager
+env.debug     # DebugEnvManager
+env.runtime   # RuntimeEnvManager
+```
+
+#### `env.compile` — compile-time options
+
+| Attribute | Env variable | Default | Description |
+|---|---|---|---|
+| `opt_level` | `FLYDSL_COMPILE_OPT_LEVEL` | `2` | Optimization level (0–3) |
+| `compile_only` | `COMPILE_ONLY` | `False` | Compile without execution |
+| `arch` | `ARCH` | `""` | Override target architecture (e.g. `gfx942`, `gfx950`) |
+| `backend` | `FLYDSL_COMPILE_BACKEND` | `"rocm"` | Compile backend id |
+
+#### `env.debug` — debug and diagnostics
+
+| Attribute | Env variable | Default | Description |
+|---|---|---|---|
+| `dump_ir` | `FLYDSL_DUMP_IR` | `False` | Dump IR stages to files |
+| `dump_dir` | `FLYDSL_DUMP_DIR` | `~/.flydsl/debug` | IR dump directory |
+| `dump_asm` | `FLYDSL_DEBUG_DUMP_ASM` | `False` | Dump assembly |
+| `ast_diff` | `FLYDSL_DEBUG_AST_DIFF` | `False` | Print AST rewrite diff |
+| `log_level` | `FLYDSL_DEBUG_LOG_LEVEL` | `"WARNING"` | Logging level |
+| `log_to_file` | `FLYDSL_DEBUG_LOG_TO_FILE` | `""` | Log file path |
+| `log_to_console` | `FLYDSL_DEBUG_LOG_TO_CONSOLE` | `False` | Console logging |
+| `print_origin_ir` | `FLYDSL_DEBUG_PRINT_ORIGIN_IR` | `False` | Print IR before passes |
+| `print_after_all` | `FLYDSL_DEBUG_PRINT_AFTER_ALL` | `False` | Print IR after each pass |
+| `enable_debug_info` | `FLYDSL_DEBUG_ENABLE_DEBUG_INFO` | `False` | Emit DWARF debug info |
+| `enable_verifier` | `FLYDSL_DEBUG_ENABLE_VERIFIER` | `True` | Run MLIR verifier |
+
+#### `env.runtime` — runtime options
+
+| Attribute | Env variable | Default | Description |
+|---|---|---|---|
+| `kind` | `FLYDSL_RUNTIME_KIND` | `"rocm"` | Device runtime kind (must match `FLYDSL_COMPILE_BACKEND`) |
+| `cache_dir` | `FLYDSL_RUNTIME_CACHE_DIR` | `~/.flydsl/cache` | Compiled kernel cache directory |
+| `enable_cache` | `FLYDSL_RUNTIME_ENABLE_CACHE` | `True` | Enable disk cache |
+
+### `EnvManager.to_dict()` / `EnvManager.help()`
+
+```python
+print(env.compile.to_dict())  # current values as dict
+print(env.debug.help())       # formatted help text with all options
+```
+
+---
+
+## `flydsl.utils.smem_allocator`
+
+`SmemAllocator` manages LDS (Local Data Store) allocation within a kernel. It computes byte offsets for multiple scratch buffers sharing the single dynamic shared memory region.
+
+<Note>
+Clear `SmemPtr._view_cache = None` after exiting an `scf.for` loop to prevent MLIR dominance errors when the same pointer is used inside and outside the loop.
+</Note>
+
+### Typical usage pattern
+
+```python
+from flydsl.utils.smem_allocator import SmemAllocator
+
+# At @jit level, compute total smem size needed:
+smem = SmemAllocator()
+smem.reserve(rows * cols * fp16_bytes, alignment=128)  # buffer A
+smem.reserve(rows * cols * fp16_bytes, alignment=128)  # buffer B
+total_smem = smem.total_bytes()
+
+# At @kernel level, get typed pointers from dynamic shared memory base:
+dyn_ptr = fx.get_dyn_shared()  # raw !fly.pointer to dynamic smem base
+# Offset arithmetic using SmemAllocator byte offsets:
+ptr_a = fx.add_offset(dyn_ptr, offset_a)
+ptr_b = fx.add_offset(dyn_ptr, offset_b)
+```
+
+### Key methods
+
+| Method | Description |
+|---|---|
+| `reserve(nbytes, alignment=16)` | Reserve `nbytes` bytes, return byte offset |
+| `total_bytes()` | Total bytes needed across all reservations |
+| `reset()` | Clear all reservations |
+
+---
+
+## `flydsl.utils.logger`
+
+Internal logging utilities. The logger name is `"flydsl"`. Control output via `FLYDSL_DEBUG_LOG_LEVEL`.
+
+```python
+from flydsl.utils import log
+
+log().debug("message")
+log().info("message")
+log().warning("message")
+```
+
+Log level can be set at runtime via `env.debug.log_level` or the `FLYDSL_DEBUG_LOG_LEVEL` environment variable.
+
+---
+
+## Quick reference: arch detection patterns
+
+```python
+from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+arch = get_rocm_arch()
+
+# Coarse CDNA/RDNA split:
+if is_rdna_arch(arch):
+    wave_size = 32
+else:
+    wave_size = 64
+
+# Fine-grained chip detection:
+if "gfx95" in arch:
+    # MI350 / MI355X (CDNA4) — MFMA_SCALE, FP4, 160 KB LDS
+    ...
+elif "gfx94" in arch:
+    # MI300X (CDNA3) — standard MFMA, 64 KB LDS
+    ...
+elif "gfx1250" in arch:
+    # MI450 — TDM ops, FP8/FP4 GEMM, wave32, cluster multicast
+    ...
+elif "gfx120" in arch:
+    # Radeon AI PRO R9700 (RDNA4) — WMMA wave32
+    ...
+```

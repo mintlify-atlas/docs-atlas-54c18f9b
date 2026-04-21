@@ -1,0 +1,450 @@
+---
+title: "Copy Atoms, MMA Atoms, and Tiled Copy Reference"
+description: "Reference for FlyDSL copy atoms, MMA atoms, TiledCopy, TiledMma, thread slicing, and tensor partitioning for AMD ROCm GPU kernels."
+---
+
+Copy atoms and MMA atoms are the bridge between FlyDSL's layout algebra and the actual AMD hardware instructions. A copy atom describes a single thread's ability to move data (buffer loads, LDS stores, universal moves). An MMA atom describes a single MFMA or WMMA instruction. Tiled variants extend atoms across all threads in a wavefront to cover a full tile.
+
+This page covers the full API: atom construction, tiled copy and MMA building, thread slicing, tensor partitioning, and execution — illustrated with the MFMA 16×16 GEMM pattern from `examples/03-tiledMma.py`.
+
+---
+
+## Copy Atoms
+
+### Available Copy Atom Types
+
+Copy atoms are constructed from a copy-operation type and an element type. The element type determines the value bit-width stored in the `!fly.copy_atom` wrapper.
+
+**Generic (hardware-agnostic):**
+
+| Python Factory | Bit Width | Description |
+|---|---|---|
+| `fx.UniversalCopy(N)` | N | Generic N-bit copy, any address space |
+| `fx.UniversalCopy8b()` | 8 | Convenience alias |
+| `fx.UniversalCopy16b()` | 16 | Convenience alias |
+| `fx.UniversalCopy32b()` | 32 | Convenience alias |
+| `fx.UniversalCopy64b()` | 64 | Convenience alias |
+| `fx.UniversalCopy128b()` | 128 | Convenience alias |
+
+**AMD CDNA3/CDNA4 (buffer descriptor):**
+
+| Python Factory | Bit Width | Description |
+|---|---|---|
+| `fx.rocdl.BufferCopy(N)` | N | AMD `raw_ptr_buffer_load/store`, N bits |
+| `fx.rocdl.BufferCopy32b()` | 32 | Convenience alias |
+| `fx.rocdl.BufferCopy64b()` | 64 | Convenience alias |
+| `fx.rocdl.BufferCopy128b()` | 128 | Convenience alias |
+| `fx.rocdl.BufferCopyLDS(N)` | N | Buffer → LDS direct copy |
+| `fx.rocdl.BufferCopyLDS32b()` | 32 | Convenience alias |
+| `fx.rocdl.BufferCopyLDS64b()` | 64 | Convenience alias |
+| `fx.rocdl.BufferCopyLDS128b()` | 128 | Convenience alias |
+
+**Atomic copy atoms:**
+
+| Python Factory | Description |
+|---|---|
+| `fx.UniversalAtomic(op, val_ty)` | Generic atomic update |
+| `fx.UniversalAtomicAdd(val_ty)` | Atomic add |
+| `fx.UniversalAtomicMax(val_ty)` | Atomic max |
+| `fx.UniversalAtomicMin(val_ty)` | Atomic min |
+| `fx.rocdl.BufferAtomic(op, val_ty)` | AMD buffer atomic |
+| `fx.rocdl.BufferAtomicAdd(val_ty)` | Buffer atomic add |
+
+<Note>
+`BufferCopy` atoms carry stateful fields: `soffset` (i32, default 0) for strided addressing. The state is tracked inside `!fly.copy_atom` and can be modified with `fx.atom_set_value`.
+</Note>
+
+### `make_copy_atom(copy_op_type, elem_type)`
+
+Wraps a copy-operation type and an element type into a `!fly.copy_atom` value for use in tiled copies.
+
+```python
+import flydsl.expr as fx
+
+# 128-bit AMD buffer copy for FP16 elements
+copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float16)
+
+# 32-bit buffer copy for FP32 elements
+copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+# Generic 128-bit copy
+copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16)
+```
+
+**Signature:** `make_copy_atom(copy_op_type, elem_type) -> !fly.copy_atom`
+
+- `copy_op_type`: Any copy-op factory from the tables above.
+- `elem_type`: A FlyDSL numeric type (`fx.Float32`, `fx.Float16`, …), an `ir.Type`, or an integer bit-width.
+
+```mlir
+%ca = fly.make_copy_atom {valBits = 32}
+    : !fly.copy_atom<!fly_rocdl.cdna3.buffer_copy<32>, 32>
+```
+
+---
+
+## Tiled Copy
+
+### `make_tiled_copy(copy_atom, layout_thr_val, tile_mn)`
+
+Distributes a copy atom across all threads in a tile by combining the per-thread/per-value layout with the tile shape.
+
+**Signature:** `make_tiled_copy(copy_atom, layout_thr_val, tile_mn) -> !fly.tiled_copy`
+
+- `copy_atom`: Result of `make_copy_atom`.
+- `layout_thr_val`: A `!fly.layout` mapping `(thread_id, value_id)` to positions. Typically built with `make_layout_tv` or `raked_product`.
+- `tile_mn`: A `!fly.tile` or tuple describing the M×N tile shape.
+
+```python
+# Build thread-value layout manually
+thr_layout     = fx.make_layout((4, 1), (1, 1))
+val_layout     = fx.make_layout((1, 8), (1, 1))
+layout_thr_val = fx.raked_product(thr_layout, val_layout)
+tile_mn        = fx.make_tile(4, 8)
+
+tiled_copy = fx.make_tiled_copy(copy_atom, layout_thr_val, tile_mn)
+```
+
+```mlir
+%tc = fly.make_tiled_copy(%copy_atom, %layout_tv, %tile_mn)
+    : (!fly.copy_atom<...>, !fly.layout<...>, !fly.tile<(4, 8)>)
+    -> !fly.tiled_copy<..., !fly.layout<...>, !fly.tile<(4, 8)>>
+```
+
+### `make_tiled_copy_A` / `make_tiled_copy_B` / `make_tiled_copy_C`
+
+Convenience helpers that derive the correct thread-value layout and tile shape directly from a `TiledMma`. These cover the most common GEMM case.
+
+```python
+copy_atom     = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+tiled_copy_A  = fx.make_tiled_copy_A(copy_atom, tiled_mma)
+tiled_copy_B  = fx.make_tiled_copy_B(copy_atom, tiled_mma)
+tiled_copy_C  = fx.make_tiled_copy_C(copy_atom, tiled_mma)
+```
+
+Each function reads the MMA's tiled thread-value layout for the corresponding operand and constructs a matching tiled copy.
+
+### `TiledCopy.get_slice(thread_id)` → `ThrCopy`
+
+Returns a `ThrCopy` object that holds all partition and retile methods for a single thread.
+
+```python
+thr_copy_A = tiled_copy_A.get_slice(tid)
+```
+
+### `ThrCopy.partition_S(tensor)` / `ThrCopy.partition_D(tensor)`
+
+Partition a source (`S`) or destination (`D`) tensor for this thread. Returns a `!fly.memref` view with the thread's subset of the tile.
+
+```python
+src_part = thr_copy.partition_S(src_tensor)   # fly.tiled_copy.partition_src
+dst_part = thr_copy.partition_D(dst_tensor)   # fly.tiled_copy.partition_dst
+```
+
+```mlir
+%src_p = fly.tiled_copy.partition_src(%tc, %src, %thr_coord)
+    : (!fly.tiled_copy<...>, !fly.memref<...>, !fly.int_tuple<?>)
+    -> !fly.memref<...>
+```
+
+### `ThrCopy.retile(tensor)`
+
+Retiles a fragment tensor (e.g. a register fragment) to match the copy atom's thread-value layout. Used to align MMA output fragments with the copy atom before writing back.
+
+```python
+copy_frag_C = thr_copy_C.retile(frag_C)   # fly.tiled_copy.retile
+```
+
+### `copy_atom_call(atom, src, dst, pred=None)`
+
+Low-level primitive that invokes the copy atom directly on pre-partitioned `!fly.memref` operands. `pred` is an optional predicate memref for boundary masking.
+
+```python
+fx.copy_atom_call(copy_atom, src_memref, dst_memref)
+fx.copy_atom_call(copy_atom, src_memref, dst_memref, pred=pred_memref)
+```
+
+### `fx.copy(copy_atom, src, dst, pred=None)`
+
+Higher-level wrapper over `fly.copy` that handles predicate passing. This is the standard call inside `@flyc.kernel`.
+
+```python
+fx.copy(copy_atom, copy_src_A, copy_frag_A, pred=None)
+fx.copy(copy_atom, copy_src_A, copy_frag_A, pred=pred_tensor)  # boundary guard
+```
+
+---
+
+## MMA Atoms
+
+### Available MMA Atom Types
+
+| Python Factory | Architecture | M×N×K | Input / Accumulator |
+|---|---|---|---|
+| `fx.rocdl.MFMA(16, 16, 4, fx.Float32)` | CDNA3 (gfx942+) | 16×16×4 | FP32 / FP32 |
+| `fx.rocdl.MFMA(16, 16, 16, fx.Float16)` | CDNA3 (gfx942+) | 16×16×16 | FP16 / FP32 |
+| `fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ)` | CDNA3 (gfx942+) | 16×16×32 | FP8 / FP32 |
+| `fx.rocdl.MFMA(32, 32, 8, fx.Float16)` | CDNA3 (gfx942+) | 32×32×8 | FP16 / FP32 |
+| `fx.rocdl.MFMA(16, 16, 32, fx.Float16, fx.Float32)` | CDNA4 (gfx950+) | 16×16×32 | FP16 / FP32 |
+| `fx.rocdl.WMMA(16, 16, 16, fx.Float16)` | GFX1250 wave32 | 16×16×16 | FP16 / FP32 |
+
+The `MFMA` factory always uses `elem_ty_ab` for both A and B input types. Pass a second type argument to override the accumulator type.
+
+### `make_mma_atom(mma_op_type)`
+
+Wraps an MMA-operation type into a `!fly.mma_atom` value.
+
+```python
+mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+```
+
+```mlir
+%ma = fly.make_mma_atom
+    : !fly.mma_atom<!fly_rocdl.cdna3.mfma<16x16x4, (f32, f32) -> f32>>
+```
+
+---
+
+## Tiled MMA
+
+### `make_tiled_mma(mma_atom, atom_layout, permutation=None)`
+
+Tiles an MMA atom across multiple warps/wavefronts by specifying how atoms are arranged.
+
+**Signature:** `make_tiled_mma(mma_atom, atom_layout, permutation=None) -> !fly.tiled_mma`
+
+- `mma_atom`: Result of `make_mma_atom`.
+- `atom_layout`: A `!fly.layout` describing how MMA atoms are distributed across the wave's threads in `(M, N, K)` dimensions.
+- `permutation`: Optional `!fly.tile` that permutes the MNK ordering of the tile.
+
+```python
+mma_atom   = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+tiled_mma  = fx.make_tiled_mma(
+    mma_atom,
+    fx.make_layout((2, 2, 1), (1, 2, 0)),   # 2×2 grid of MMA atoms in M×N
+)
+```
+
+```mlir
+%tiled = fly.make_tiled_mma(%mma_atom, %layout)
+    : (!fly.mma_atom<...>, !fly.layout<(2, 2, 1):(1, 2, 0)>)
+    -> !fly.tiled_mma<..., !fly.layout<(2, 2, 1):(1, 2, 0)>>
+```
+
+### `TiledMma.get_slice(thread_id)` / `TiledMma.thr_slice(thread_id)` → `ThrMma`
+
+Both names return a `ThrMma` view for a single thread. `thr_slice` is the alias used in examples.
+
+```python
+thr_mma = tiled_mma.thr_slice(tid)
+thr_mma = tiled_mma.get_slice(tid)   # identical
+```
+
+### `ThrMma.make_fragment_A/B/C(tensor)` — Register Fragments
+
+Allocate register-space fragment tensors sized to hold each MMA operand for this thread.
+
+```python
+frag_A = thr_mma.make_fragment_A(bA)   # fly.mma.make_fragment A
+frag_B = thr_mma.make_fragment_B(bB)   # fly.mma.make_fragment B
+frag_C = thr_mma.make_fragment_C(bC)   # fly.mma.make_fragment C
+```
+
+The input tensor (`bA`, `bB`, `bC`) is the block-level tile view (after `zipped_divide` + `slice`), not the per-thread partition.
+
+### `mma_atom_call(mma_atom, d, a, b, c)`
+
+Low-level primitive that invokes the MMA atom directly.
+
+```python
+fx.mma_atom_call(mma_atom, frag_D, frag_A, frag_B, frag_C)
+```
+
+### `fx.gemm(mma_atom, d, a, b, c)`
+
+Higher-level GEMM wrapper. Executes `D = A × B + C` in-place using the tiled MMA. This is the standard call inside `@flyc.kernel`.
+
+```python
+frag_C.fill(0)                              # zero accumulator
+fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
+```
+
+```mlir
+fly.gemm(%mma_atom, %d, %a, %b, %c)
+    : (!fly.mma_atom<...>, !fly.memref<...>, !fly.memref<...>,
+       !fly.memref<...>, !fly.memref<...>)
+```
+
+---
+
+## Introspection Properties
+
+| Property | Object | Type | Description |
+|---|---|---|---|
+| `copy_atom.thr_layout` | `CopyAtom` | layout | Thread layout of the copy atom |
+| `copy_atom.tv_layout_src` | `CopyAtom` | layout | Thread-value layout for source |
+| `copy_atom.tv_layout_dst` | `CopyAtom` | layout | Thread-value layout for destination |
+| `mma_atom.thr_layout` | `MmaAtom` | layout | Thread layout of the MMA atom |
+| `mma_atom.shape_mnk` | `MmaAtom` | int_tuple | M×N×K dimensions |
+| `mma_atom.tv_layout_A` | `MmaAtom` | layout | Thread-value layout for A operand |
+| `mma_atom.tv_layout_B` | `MmaAtom` | layout | Thread-value layout for B operand |
+| `mma_atom.tv_layout_C` | `MmaAtom` | layout | Thread-value layout for C operand |
+| `tiled_copy.tiled_tv_layout_S` | `TiledCopy` | layout | Full tiled source layout |
+| `tiled_copy.tiled_tv_layout_D` | `TiledCopy` | layout | Full tiled destination layout |
+| `tiled_mma.tile_size_mnk` | `TiledMma` | int_tuple | M×N×K tile dimensions |
+| `tiled_mma.thr_layout_vmnk` | `TiledMma` | layout | Thread layout across V, M, N, K |
+| `tiled_mma.tv_layout_A_tiled` | `TiledMma` | layout | Full tiled thread-value layout for A |
+| `tiled_mma.tv_layout_B_tiled` | `TiledMma` | layout | Full tiled thread-value layout for B |
+| `tiled_mma.tv_layout_C_tiled` | `TiledMma` | layout | Full tiled thread-value layout for C |
+
+---
+
+## MFMA 16×16 Pattern: `examples/03-tiledMma.py`
+
+The following is the complete, runnable GEMM kernel from `examples/03-tiledMma.py`. It demonstrates the canonical MFMA 16×16 pattern: buffer tensors → `zipped_divide` → `slice` → build atoms → `get_slice` → `partition_S` → `make_fragment_*` → `retile` → `copy` → `gemm` → `copy`.
+
+```python
+import torch
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+block_m = 64
+block_n = 64
+block_k = 8
+
+
+@flyc.kernel
+def gemm_kernel(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+):
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+
+    # Step 1: Wrap tensors in AMD buffer descriptors for efficient global access
+    A = fx.rocdl.make_buffer_tensor(A)
+    B = fx.rocdl.make_buffer_tensor(B)
+    C = fx.rocdl.make_buffer_tensor(C)
+
+    # Step 2: Partition each tensor into (tile, block-index) views
+    bA = fx.zipped_divide(A, (block_m, block_k))   # shape: ((64, 8), num_blocks)
+    bB = fx.zipped_divide(B, (block_n, block_k))
+    bC = fx.zipped_divide(C, (block_m, block_n))
+
+    # Step 3: Select this thread-block's tile
+    bA = fx.slice(bA, (None, bid))
+    bB = fx.slice(bB, (None, bid))
+    bC = fx.slice(bC, (None, bid))
+
+    # Step 4: Build MMA atom — MFMA 16×16×4 FP32 with a 2×2 atom layout
+    mma_atom  = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)))
+    thr_mma   = tiled_mma.thr_slice(tid)
+
+    # Step 5: Build copy atoms matched to the MMA's A, B, C layouts
+    copy_atom    = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    tiled_copy_A = fx.make_tiled_copy_A(copy_atom, tiled_mma)
+    tiled_copy_B = fx.make_tiled_copy_B(copy_atom, tiled_mma)
+    tiled_copy_C = fx.make_tiled_copy_C(copy_atom, tiled_mma)
+
+    # Step 6: Get per-thread copy slices
+    thr_copy_A = tiled_copy_A.get_slice(tid)
+    thr_copy_B = tiled_copy_B.get_slice(tid)
+    thr_copy_C = tiled_copy_C.get_slice(tid)
+
+    # Step 7: Partition global tile for each thread
+    copy_src_A = thr_copy_A.partition_S(bA)
+    copy_src_B = thr_copy_B.partition_S(bB)
+    copy_dst_C = thr_copy_C.partition_S(bC)
+
+    # Step 8: Allocate register fragments (sized by the MMA operand layouts)
+    frag_A = thr_mma.make_fragment_A(bA)
+    frag_B = thr_mma.make_fragment_B(bB)
+    frag_C = thr_mma.make_fragment_C(bC)
+
+    # Step 9: Retile fragments to match the copy atom layout
+    copy_frag_A = thr_copy_A.retile(frag_A)
+    copy_frag_B = thr_copy_B.retile(frag_B)
+    copy_frag_C = thr_copy_C.retile(frag_C)
+
+    # Step 10: Load A and B from global memory into registers
+    fx.copy(copy_atom, copy_src_A, copy_frag_A, pred=None)
+    fx.copy(copy_atom, copy_src_B, copy_frag_B, pred=None)
+
+    # Step 11: Execute GEMM: C = A × B + 0
+    frag_C.fill(0)
+    fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
+
+    # Step 12: Write accumulator back to global memory
+    fx.copy(copy_atom, copy_frag_C, copy_dst_C, pred=None)
+
+
+@flyc.jit
+def tiledMma(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    stream: fx.Stream = fx.Stream(None),
+):
+    gemm_kernel(A, B, C).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
+
+
+# Run
+M, N, K = block_m, block_n, block_k
+A = torch.randn(M, K, dtype=torch.float32).cuda()
+B = torch.randn(N, K, dtype=torch.float32).cuda()
+C = torch.zeros(M, N, dtype=torch.float32).cuda()
+
+tiledMma(A, B, C, stream=torch.cuda.Stream())
+torch.cuda.synchronize()
+
+expected = A @ B.T
+print("Result correct:", torch.allclose(C, expected, atol=1e-5, rtol=1e-5))
+```
+
+<Warning>
+Always call `thr_mma.make_fragment_*` on the block-level tile views (`bA`, `bB`, `bC`) — **not** on `partition_S` outputs. The MMA fragment size is determined by the block tile shape, not the per-thread copy partition.
+</Warning>
+
+The `block=(256, 1, 1)` launch configuration provides exactly the wavefront size required by the `2×2` atom layout over a 64-thread MFMA 16×16×4 atom (64 threads × 4 atoms = 256 threads).
+
+---
+
+## Summary: Call Sequence for a Tiled GEMM
+
+```
+make_mma_atom(...)
+    └─ make_tiled_mma(mma_atom, atom_layout)
+           └─ tiled_mma.thr_slice(tid)         → ThrMma
+                  ├─ thr_mma.make_fragment_A(bA)
+                  ├─ thr_mma.make_fragment_B(bB)
+                  └─ thr_mma.make_fragment_C(bC)
+
+make_copy_atom(...)
+    └─ make_tiled_copy_{A,B,C}(copy_atom, tiled_mma)
+           └─ tiled_copy.get_slice(tid)         → ThrCopy
+                  ├─ thr_copy.partition_S(tile)
+                  ├─ thr_copy.partition_D(tile)
+                  └─ thr_copy.retile(fragment)
+
+fx.copy(copy_atom, src_part, frag)             # load
+fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)  # compute
+fx.copy(copy_atom, frag_C, dst_part)           # store
+```
+
+---
+
+## Source File Reference
+
+| File | Description |
+|---|---|
+| `python/flydsl/expr/primitive.py` | `make_copy_atom`, `make_mma_atom`, `make_tiled_copy`, `make_tiled_mma`, `copy`, `gemm`, `copy_atom_call`, `mma_atom_call` |
+| `python/flydsl/expr/derived.py` | `ThrCopy`, `ThrMma`, `make_tiled_copy_A/B/C`, `make_layout_tv` |
+| `python/flydsl/expr/rocdl/universal.py` | `BufferCopy`, `BufferCopyLDS`, `BufferAtomic`, `MFMA`, `WMMA`, `make_buffer_tensor` |
+| `include/flydsl/Dialect/Fly/IR/FlyOps.td` | `fly.make_copy_atom`, `fly.make_mma_atom`, `fly.make_tiled_copy`, `fly.make_tiled_mma`, `fly.copy`, `fly.gemm` |
+| `include/flydsl/Dialect/FlyROCDL/IR/CopyAtom.td` | `CopyOpCDNA3BufferCopy`, `CopyOpCDNA3BufferCopyLDS`, `CopyOpCDNA3BufferAtomic` |
+| `include/flydsl/Dialect/FlyROCDL/IR/MmaAtom.td` | `MmaOpCDNA3_MFMA`, `MmaOpCDNA4_MFMAScale`, `MmaOpGFX1250_WMMA` |
+| `examples/03-tiledMma.py` | Full runnable MFMA 16×16 GEMM example |
+| `kernels/preshuffle_gemm.py` | Production GEMM with preshuffle and pipelining |

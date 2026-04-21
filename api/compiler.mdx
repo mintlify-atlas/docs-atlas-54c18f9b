@@ -1,0 +1,339 @@
+---
+title: "flydsl.compiler (flyc) — JIT & Kernel Compilation API"
+description: "Complete reference for the FlyDSL compiler: @kernel, @jit, compile(), CompiledFunction, backends, JitArgumentRegistry, and all environment variables."
+keywords: ["flydsl", "flyc", "JIT", "kernel", "compiler", "backend", "ROCm", "MLIR"]
+---
+
+The `flydsl.compiler` module — conventionally imported as `flyc` — provides the two primary decorators for authoring and launching GPU kernels (`@kernel`, `@jit`), a fast ahead-of-time `compile()` path, a pluggable backend registry, and argument adaptation utilities.
+
+```python
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+```
+
+---
+
+## `@flyc.kernel` decorator
+
+`@kernel` marks a function as a GPU kernel body. When called inside a `@jit` function, it traces the function body into an MLIR `gpu.func` and returns a `KernelLauncher`.
+
+```python
+@flyc.kernel
+def my_kernel(a: fx.Tensor, b: fx.Tensor, n: fx.Constexpr[int]):
+    tid = fx.gpu.thread_idx.x
+    # kernel body...
+```
+
+### Decorator options
+
+<ParamField path="name" type="str | None" default="None">
+  Override the kernel's symbol name. Visible in profilers (e.g., rocprof). If omitted, defaults to `<func_name>_<id>`.
+</ParamField>
+
+<ParamField path="known_block_size" type="list[int] | None" default="None">
+  Three-element list `[x, y, z]` declaring the launch block size. Required when the block exceeds 256 threads — the AMDGPU backend uses this to set `max_flat_workgroup_size`.
+</ParamField>
+
+```python
+@flyc.kernel(name="gemm_bf16_m128n128k64", known_block_size=[256, 1, 1])
+def gemm_kernel(a: fx.Tensor, b: fx.Tensor, c: fx.Tensor):
+    ...
+```
+
+### How tracing works
+
+1. The `@kernel` body is transformed by `ASTRewriter` to rewrite Python control flow (`if`, `for`, `while`) into MLIR SCF dialect ops.
+2. Parameters annotated with `Constexpr[T]` are resolved at trace time (baked in) and excluded from the IR function signature.
+3. Non-constexpr parameters map to MLIR block arguments using the `fly_types` / `fly_construct` protocol.
+4. Calling the `KernelFunction` inside a `@jit` function emits `gpu.func` into the current GPU module and returns a `KernelLauncher`.
+
+### `KernelLauncher.launch()`
+
+```python
+launcher = my_kernel(a, b, n=128)
+
+launcher.launch(
+    grid=(M // 128, N // 128, 1),
+    block=(256, 1, 1),
+    smem=65536,          # dynamic shared memory bytes
+    stream=stream_arg,   # ir.Value; None = default stream from @jit context
+    cluster=(2, 2, 1),   # optional: workgroup cluster dims (gfx1250)
+)
+```
+
+<ParamField path="grid" type="int | tuple | ir.Value">
+  Grid dimensions `(x, y, z)`. Accepts Python int, `ir.Value`, or tuple.
+</ParamField>
+
+<ParamField path="block" type="int | tuple | ir.Value">
+  Block (workgroup) dimensions `(x, y, z)`.
+</ParamField>
+
+<ParamField path="smem" type="int | ir.Value" default="0">
+  Dynamic shared memory size in bytes.
+</ParamField>
+
+<ParamField path="stream" type="ir.Value | None" default="None">
+  Async stream. Defaults to the stream argument propagated from the enclosing `@jit` function.
+</ParamField>
+
+<ParamField path="cluster" type="tuple | None" default="None">
+  Workgroup cluster dimensions for TDM / MCAST on gfx1250. Enables `gpu.LaunchFuncOp` cluster attribute.
+</ParamField>
+
+---
+
+## `@flyc.jit` decorator
+
+`@jit` marks a host-side launcher function for JIT compilation. On the first call it traces the body through `ASTRewriter`, emits MLIR, runs the pass pipeline, and launches via the execution engine. Subsequent calls with the same argument types hit an in-process `CallState` cache.
+
+```python
+@flyc.jit
+def launch_gemm(c: torch.Tensor, a: torch.Tensor, b: torch.Tensor, M: int, N: int, K: int):
+    launcher = my_kernel(a, b, c, M, N, K)
+    launcher.launch(grid=(M // 128, N // 128), block=(256, 1, 1))
+```
+
+### Caching
+
+- **In-process**: first compilation result stored in `JitFunction._mem_cache` (keyed by argument types/shapes).
+- **Disk**: serialized to `~/.flydsl/cache/<func>_<hash>/<key>.pkl` when `FLYDSL_RUNTIME_ENABLE_CACHE=1` (the default).
+- **Cache key**: SHA-256 over FlyDSL toolchain fingerprint + function source + dependency sources + closure scalar values.
+- Disk cache is **automatically invalidated** when any Python source file under `flydsl.compiler.*`, `flydsl.expr.*`, native `.so` binaries, or the version string changes.
+
+<Warning>
+Set `FLYDSL_RUNTIME_ENABLE_CACHE=0` while iterating on kernel code. The in-process cache is always active and clears only when the Python process restarts.
+</Warning>
+
+### Compile hints via `JitFunction.compile_hints`
+
+Pass hints when constructing or calling `jit`:
+
+```python
+fn = flyc.jit(my_launcher)
+fn.compile_hints = {"waves_per_eu": 2, "maxnreg": 128}
+```
+
+Or use `flyc.compile[hints](fn, *args)`.
+
+---
+
+## `flyc.compile()`
+
+Pre-compiles a `@jit` function with a concrete set of arguments, returning a `CompiledFunction` with minimal dispatch overhead.
+
+```python
+# Compile once:
+compiled = flyc.compile(launch_gemm, c, a, b, M, N, K, stream)
+
+# Hot loop — ~5 µs overhead:
+for _ in range(100):
+    compiled(c, a, b, M, N, K, stream)
+```
+
+`compile()` accepts only positional arguments. It forces one compilation call to initialize the cache, then wraps the pre-allocated `CallState` in a `CompiledFunction`.
+
+### With compile hints
+
+```python
+compiled = flyc.compile[{"waves_per_eu": 2}](launch_gemm, c, a, b, M, N, K, stream)
+```
+
+---
+
+## `CompiledFunction`
+
+Pre-compiled callable returned by `flyc.compile()`. Accepts positional arguments only, same count and order as the original `@jit` function.
+
+```python
+class CompiledFunction:
+    def __call__(self, *args): ...
+```
+
+The `CompiledFunction` holds a reference to the underlying `CompiledArtifact` (and its `ExecutionEngine`) to prevent garbage collection of the code object.
+
+---
+
+## Backend API
+
+### `GPUTarget`
+
+Frozen dataclass describing the compilation target.
+
+| Field | Type | Description |
+|---|---|---|
+| `arch` | `str` | GPU architecture string, e.g. `"gfx942"` |
+
+### `BaseBackend`
+
+Abstract base class for compile backends. Subclass to add support for new hardware or runtimes.
+
+Key methods to implement:
+
+```python
+class BaseBackend:
+    @classmethod
+    def make_target(cls, arch: str) -> GPUTarget: ...
+    @classmethod
+    def detect_target(cls) -> GPUTarget: ...
+    def pipeline_fragments(self, compile_hints: dict) -> list[str]: ...
+    def gpu_module_targets(self) -> list[str]: ...
+    def native_lib_patterns(self) -> list[str]: ...
+    def hash(self) -> str: ...
+```
+
+### `get_backend(name=None, *, arch="") → BaseBackend`
+
+Resolves a backend instance. Reads `FLYDSL_COMPILE_BACKEND` (default `"rocm"`) when `name` is not provided. Pass `arch` to override auto-detection.
+
+```python
+backend = flyc.get_backend()           # use env default
+backend = flyc.get_backend("rocm")     # explicit
+backend = flyc.get_backend(arch="gfx950")  # explicit arch
+```
+
+### `register_backend(name, backend_cls, *, force=False)`
+
+Register a third-party backend class under a case-insensitive name.
+
+```python
+flyc.register_backend("my_hw", MyHWBackend)
+```
+
+### `compile_backend_name() → str`
+
+Returns the active backend id from `FLYDSL_COMPILE_BACKEND` (default `"rocm"`).
+
+---
+
+## `JitArgumentRegistry`
+
+Extensible registry mapping Python types to JIT argument constructors and DSL types.
+
+```python
+from flydsl.compiler import JitArgumentRegistry
+
+@JitArgumentRegistry.register(MyTensorType, dsl_type=fx.Tensor)
+class MyTensorAdaptor:
+    def __init__(self, tensor): ...
+    def __fly_types__(self): ...       # list of MLIR types
+    def __fly_ptrs__(self): ...        # list of ctypes pointers
+    @classmethod
+    def _reusable_slot_spec(cls, arg): ...  # (ctype, extract_fn) for fast path
+```
+
+### Built-in registrations
+
+| Python type | JIT adaptor | DSL type |
+|---|---|---|
+| `torch.Tensor` | `TensorAdaptor` | `fx.Tensor` |
+| `int` | `Int32` | `fx.Int32` |
+| `float` | `Float32` | `fx.Float32` |
+| `bool` | `Boolean` | `fx.Boolean` |
+| `torch.cuda.Stream` | `Stream` | `fx.Stream` |
+
+### `from_dlpack(tensor, *, assumed_align=None, use_32bit_stride=False) → TensorAdaptor`
+
+Creates a `TensorAdaptor` from a PyTorch tensor with optional alignment hints.
+
+<ParamField path="tensor" type="torch.Tensor">
+  Input tensor. Float8 tensors are automatically reinterpreted as `uint8` for DLPack compatibility.
+</ParamField>
+
+<ParamField path="assumed_align" type="int | None" default="None">
+  Override assumed pointer alignment (bytes). Improves vectorization when the kernel assumes aligned access.
+</ParamField>
+
+<ParamField path="use_32bit_stride" type="bool" default="False">
+  Use 32-bit stride values instead of 64-bit (reduces register pressure for known-small tensors).
+</ParamField>
+
+```python
+arg = flyc.from_dlpack(tensor, assumed_align=128)
+```
+
+---
+
+## Compiler options (compile hints)
+
+Pass as a `dict` to `JitFunction.compile_hints` or via `flyc.compile[hints]`.
+
+| Key | Type | Description |
+|---|---|---|
+| `waves_per_eu` | `int` | Target occupancy waves per execution unit |
+| `maxnreg` | `int` | Maximum VGPR count per thread |
+| `num_warps` | `int` | Number of warps (used by autotuner; kernel-level hint) |
+| `fast_fp_math` | `bool` | Enable aggressive FP math optimizations |
+| `llvm_options` | `str` | Raw LLVM command-line options forwarded to the backend |
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLYDSL_RUNTIME_ENABLE_CACHE` | `1` | Enable disk cache for compiled kernels |
+| `FLYDSL_RUNTIME_CACHE_DIR` | `~/.flydsl/cache` | Disk cache root directory |
+| `FLYDSL_DUMP_IR` | `0` | Dump MLIR IR at each pipeline stage to `FLYDSL_DUMP_DIR`; also disables disk cache |
+| `FLYDSL_DUMP_DIR` | `~/.flydsl/debug` | Directory for IR dumps |
+| `FLYDSL_COMPILE_BACKEND` | `rocm` | Active compile backend id |
+| `FLYDSL_COMPILE_ARCH` | `""` | Override target GPU architecture (e.g. `gfx942`) |
+| `FLYDSL_COMPILE_OPT_LEVEL` | `2` | Optimization level (0–3) |
+| `COMPILE_ONLY` | `0` | Compile without launching; useful for CI without GPU |
+| `FLYDSL_DEBUG_PRINT_ORIGIN_IR` | `0` | Print origin IR before passes |
+| `FLYDSL_DEBUG_PRINT_AFTER_ALL` | `0` | Print IR after every MLIR pass |
+| `FLYDSL_DEBUG_ENABLE_VERIFIER` | `1` | Run MLIR verifier after each pass |
+| `FLYDSL_DEBUG_LOG_LEVEL` | `WARNING` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+<Tip>
+When debugging a new kernel, start with `FLYDSL_DUMP_IR=1 FLYDSL_RUNTIME_ENABLE_CACHE=0`. This writes every compilation stage as a numbered `.mlir` file under `~/.flydsl/debug/<kernel_name>/` and ensures you always recompile from scratch.
+</Tip>
+
+---
+
+## Cache location and structure
+
+```
+~/.flydsl/cache/
+  <func_name>_<manager_key>/
+    <cache_key_sha256>.pkl    # serialized CompiledArtifact
+
+~/.flydsl/debug/
+  <kernel_name>/
+    00_origin.mlir
+    01_<pass_stage>.mlir
+    ...
+    NN_final_isa.s
+```
+
+The `manager_key` is a 32-character hex digest of the toolchain fingerprint (Python sources + native `.so` hashes + version). The `cache_key` encodes argument types, shapes, and compile hints.
+
+---
+
+## Full example
+
+```python
+import torch
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+@flyc.kernel(known_block_size=[256, 1, 1])
+def vector_add(a: fx.Tensor, b: fx.Tensor, c: fx.Tensor, n: fx.Constexpr[int]):
+    tid = fx.gpu.thread_idx.x
+    bid = fx.gpu.block_idx.x
+    idx = bid * 256 + tid
+    val = a[idx] + b[idx]
+    c[idx] = val
+
+@flyc.jit
+def launch(c: torch.Tensor, a: torch.Tensor, b: torch.Tensor, n: int):
+    launcher = vector_add(a, b, c, n)
+    launcher.launch(grid=(n // 256,), block=(256,))
+
+n = 1024
+a = torch.randn(n, device="cuda", dtype=torch.float32)
+b = torch.randn(n, device="cuda", dtype=torch.float32)
+c = torch.empty(n, device="cuda", dtype=torch.float32)
+
+launch(c, a, b, n)
+```

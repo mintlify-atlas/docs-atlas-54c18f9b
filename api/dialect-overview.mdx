@@ -1,0 +1,258 @@
+---
+title: "Fly MLIR Dialect: Types, Passes, and IR Overview"
+description: "Reference for the Fly MLIR dialect: custom types, FlyROCDL ops, Python-to-IR mapping, compilation passes, and the fly-opt CLI tool."
+---
+
+The Fly dialect is the MLIR IR layer at the heart of FlyDSL. When you call layout algebra functions inside a `@flyc.kernel` or `@flyc.jit` body, each call traces directly to a Fly dialect op. The compiler then lowers those ops through a fixed pass pipeline to produce an HSACO binary that runs on AMD ROCm hardware.
+
+This page covers the dialect's custom types, the companion FlyROCDL dialect for hardware-specific atoms, how Python DSL calls map to dialect ops, the compilation passes, and debugging tools.
+
+---
+
+## Custom Types
+
+The Fly dialect defines its own type system inside `include/flydsl/Dialect/Fly/IR/FlyTypeDefs.td`. All type mnemonics live under the `!fly.` namespace.
+
+### `!fly.int_tuple`
+
+An integer tuple type that encodes shapes, strides, and coordinates. Values can be static (folded into the type) or dynamic (carried as SSA operands). Nesting is supported for hierarchical layouts.
+
+```mlir
+// Static 2-D shape (8, 16)
+%s = fly.make_shape() : !fly.int_tuple<(8, 16)>
+
+// Nested shape (8, (4, 2))
+%sn = fly.make_shape() : !fly.int_tuple<(8, (4, 2))>
+
+// Dynamic — one element is an SSA value
+%d = fly.make_shape(%n : i32) : !fly.int_tuple<(8, ?)>
+```
+
+### `!fly.layout`
+
+A `(Shape, Stride)` pair that defines a coordinate-to-index mapping. The type carries both components; all-static layouts have no dynamic operands.
+
+```mlir
+// Layout (8, 16):(1, 8) — 8×16 column-major
+%ly = fly.make_layout(%shape, %stride)
+    : (!fly.int_tuple<(8, 16)>, !fly.int_tuple<(1, 8)>) -> !fly.layout<(8, 16):(1, 8)>
+```
+
+### `!fly.composed_layout`
+
+A three-component composed layout `(inner, offset, outer)` used for swizzled or multi-level address mappings. The `inner` component may itself be a `!fly.layout` or a `!fly.swizzle`.
+
+```mlir
+%cl = fly.make_composed_layout(%inner, %offset, %outer)
+    : (!fly.layout<...>, !fly.int_tuple<0>, !fly.layout<...>) -> !fly.composed_layout<...>
+```
+
+### `!fly.ptr`
+
+A typed pointer with address space, alignment, and an optional swizzle annotation. Address spaces include `Global`, `Shared` (LDS), `Register`, and `BufferDesc` (AMD buffer descriptor).
+
+```mlir
+// Global FP16 pointer
+%p = fly.make_ptr(...) : !fly.ptr<f16, global>
+
+// LDS FP32 pointer with 128-bit alignment
+%lds = fly.get_dyn_shared() : !fly.ptr<f32, shared, align=128>
+```
+
+### `!fly.memref`
+
+A memory reference that bundles an element type, address space, layout, alignment, and swizzle into a single typed value. Most tiled-copy and MMA fragment operations work with `!fly.memref`.
+
+```mlir
+// Global FP32 memref with layout (64, 64):(1, 64)
+%mr : !fly.memref<f32, global, (64, 64):(1, 64)>
+```
+
+### `!fly.swizzle`
+
+Carries a swizzle descriptor (bit-width and XOR mask parameters) used for LDS bank-conflict avoidance. Appears as the layout of composed layouts applied to shared-memory memrefs.
+
+### `!fly.copy_atom`
+
+Wraps a copy-operation type (e.g. `!fly.universal_copy<128>` or `!fly_rocdl.cdna3.buffer_copy<128>`) together with the value bit-width. Built by `fly.make_copy_atom`.
+
+```mlir
+%ca = fly.make_copy_atom {valBits = 32}
+    : !fly.copy_atom<!fly_rocdl.cdna3.buffer_copy<32>, 32>
+```
+
+### `!fly.mma_atom`
+
+Wraps an MMA-operation type (e.g. `!fly_rocdl.cdna3.mfma<16x16x4, (f32, f32) -> f32>`). Built by `fly.make_mma_atom`.
+
+```mlir
+%ma = fly.make_mma_atom
+    : !fly.mma_atom<!fly_rocdl.cdna3.mfma<16x16x4, (f32, f32) -> f32>>
+```
+
+---
+
+## FlyROCDL Dialect
+
+The companion `fly_rocdl` dialect (`include/flydsl/Dialect/FlyROCDL/`) defines hardware-specific copy and MMA atom types. These types are embedded inside `!fly.copy_atom` and `!fly.mma_atom` wrappers.
+
+### Copy Atom Types
+
+| MLIR Type | Python Factory | Description |
+|---|---|---|
+| `!fly_rocdl.cdna3.buffer_copy<N>` | `fx.rocdl.BufferCopy(N)` | AMD buffer-descriptor load/store, N bits |
+| `!fly_rocdl.cdna3.buffer_copy_lds<N>` | `fx.rocdl.BufferCopyLDS(N)` | Buffer-to-LDS direct copy, N bits |
+| `!fly_rocdl.cdna3.buffer_atomic<op, ty>` | `fx.rocdl.BufferAtomic(op, ty)` | Buffer atomic (Add, Max, Min, …) |
+| `!fly_rocdl.cdna4.lds_read_trans<trans=Nb, N>` | *(low-level)* | CDNA4 LDS transpose read |
+| `!fly.universal_copy<N>` | `fx.UniversalCopy(N)` | Generic N-bit copy (any address space) |
+| `!fly.universal_atomic<op, ty>` | `fx.UniversalAtomic(op, ty)` | Generic atomic update |
+
+`BufferCopy` atoms carry a stateful `soffset` field (i32, default 0) used for strided buffer addressing.
+
+### MMA Atom Types
+
+| MLIR Type | Python Factory | Description |
+|---|---|---|
+| `!fly_rocdl.cdna3.mfma<MxNxK, (A, B) -> Acc>` | `fx.rocdl.MFMA(M, N, K, elem_ty)` | CDNA3/4 MFMA instruction |
+| `!fly_rocdl.cdna4.mfma_scale<MxNxK, ...>` | *(stateful MMA)* | CDNA4 MFMA with per-operand scale |
+| `!fly_rocdl.gfx1250.wmma<MxNxK, (A, B) -> Acc>` | `fx.rocdl.WMMA(M, N, K, elem_ty)` | GFX1250 WMMA wave32 instruction |
+
+---
+
+## Python API to Dialect Op Mapping
+
+Every call to a layout function inside a traced kernel body emits a Fly dialect op. The table below lists the most important Python functions and the ops they produce.
+
+| Python (`flydsl.expr`) | Fly Dialect Op | Notes |
+|---|---|---|
+| `fx.make_shape(8, 16)` | `fly.make_shape` | Returns `!fly.int_tuple` |
+| `fx.make_stride(1, 8)` | `fly.make_stride` | Returns `!fly.int_tuple` |
+| `fx.make_layout(s, d)` | `fly.make_layout` | Returns `!fly.layout` |
+| `fx.make_coord(i, j)` | `fly.make_coord` | Returns `!fly.int_tuple` |
+| `fx.make_ordered_layout(s, o)` | `fly.make_ordered_layout` | Stride order given explicitly |
+| `fx.crd2idx(c, ly)` | `fly.crd2idx` | Coord → linear index |
+| `fx.idx2crd(i, ly)` | `fly.idx2crd` | Index → coordinate |
+| `fx.size(x)` | `fly.size` | Product of all dimensions |
+| `fx.cosize(ly)` | `fly.cosize` | Codomain size |
+| `fx.get_shape(ly)` | `fly.get_shape` | Extract shape IntTuple |
+| `fx.get_stride(ly)` | `fly.get_stride` | Extract stride IntTuple |
+| `fx.composition(A, B)` | `fly.composition` | A ∘ B |
+| `fx.complement(ly, sz)` | `fly.complement` | Complement of layout |
+| `fx.coalesce(ly)` | `fly.coalesce` | Simplify layout |
+| `fx.right_inverse(ly)` | `fly.right_inverse` | Right inverse |
+| `fx.logical_product(A, B)` | `fly.logical_product` | Basic product |
+| `fx.raked_product(A, B)` | `fly.raked_product` | Raked/interleaved product |
+| `fx.logical_divide(A, B)` | `fly.logical_divide` | Basic divide |
+| `fx.zipped_divide(A, B)` | `fly.zipped_divide` | Zipped divide |
+| `fx.make_copy_atom(op, ty)` | `fly.make_copy_atom` | Returns `!fly.copy_atom` |
+| `fx.make_mma_atom(op)` | `fly.make_mma_atom` | Returns `!fly.mma_atom` |
+| `fx.make_tiled_copy(ca, tv, mn)` | `fly.make_tiled_copy` | Returns `!fly.tiled_copy` |
+| `fx.make_tiled_mma(ma, layout)` | `fly.make_tiled_mma` | Returns `!fly.tiled_mma` |
+| `thr_copy.partition_S(src)` | `fly.tiled_copy.partition_src` | Per-thread source slice |
+| `thr_copy.partition_D(dst)` | `fly.tiled_copy.partition_dst` | Per-thread dest slice |
+| `fx.copy(ca, src, dst)` | `fly.copy` | Execute tiled copy |
+| `fx.gemm(ma, d, a, b, c)` | `fly.gemm` | Execute MFMA GEMM |
+
+---
+
+## Compilation Passes
+
+The `MlirCompiler` in `python/flydsl/compiler/jit_function.py` runs a fixed pass sequence. The three Fly-specific passes run early, before standard lowering.
+
+| Pass | CLI Name | Description |
+|---|---|---|
+| Fly canonicalize | `fly-canonicalize` | FlyDSL-specific simplifications: constant folding, dead-op elimination, and layout normalization. |
+| Fly layout lowering | `fly-layout-lowering` | Lowers all layout algebra ops (`composition`, `product`, `divide`, `crd2idx`, etc.) to standard arithmetic, vector, and GPU ops. |
+| Fly → ROCDL | `convert-fly-to-rocdl` | Converts remaining Fly ops (copy atoms, MMA atoms, memref ops) to ROCDL intrinsics. |
+
+Additional dialect-specific passes used in the full pipeline:
+
+| Pass | Description |
+|---|---|
+| `fly-rewrite-func-signature` | Rewrites function signatures: DSL types become packed LLVM structs; fully-static arguments are removed and reconstructed inside the body. |
+| `fly-convert-atom-call-to-ssa-form` | Promotes `copy_atom_call` / `mma_atom_call` to SSA form (`copy_atom_call_ssa` / `mma_atom_call_ssa`) where register tensors can be lifted to vector SSA values. |
+| `fly-promote-regmem-to-vectorssa` | Promotes register-address-space `fly.make_ptr` memory to proper vector SSA values. Requires `fly-convert-atom-call-to-ssa-form` to have run first. |
+
+<Note>
+The order of these passes is fixed and defined in `MlirCompiler._pipeline_fragments()`. Reordering them outside the standard pipeline will produce incorrect IR.
+</Note>
+
+---
+
+## The `fly-opt` CLI Tool
+
+`fly-opt` is the standalone MLIR optimizer for Fly dialect IR, built to `tools/fly-opt`. It accepts `.mlir` files and runs any combination of passes, making it the primary tool for developing and debugging Fly dialect transformations without invoking the Python frontend.
+
+```bash
+# Run the full layout-lowering pass on a hand-written .mlir file
+fly-opt --fly-layout-lowering my_kernel.mlir -o lowered.mlir
+
+# Run canonicalize then layout-lowering then Fly-to-ROCDL
+fly-opt --fly-canonicalize \
+        --fly-layout-lowering \
+        --convert-fly-to-rocdl \
+        my_kernel.mlir
+
+# Print registered passes
+fly-opt --help
+```
+
+MLIR lit tests in `tests/mlir/` use `fly-opt` as the execution driver:
+
+```mlir
+// RUN: fly-opt --fly-layout-lowering %s | FileCheck %s
+func.func @test_crd2idx(%coord : !fly.int_tuple<(3, 5)>) -> !fly.int_tuple<?> {
+  %ly = fly.static : !fly.layout<(8, 16):(1, 8)>
+  %idx = fly.crd2idx(%coord, %ly) : (!fly.int_tuple<(3, 5)>, !fly.layout<(8, 16):(1, 8)>) -> !fly.int_tuple<?>
+  return %idx : !fly.int_tuple<?>
+}
+```
+
+---
+
+## Observing IR with `FLYDSL_DUMP_IR`
+
+Setting `FLYDSL_DUMP_IR=1` instructs the compiler to write a numbered `.mlir` file after every pass. This is the fastest way to understand what each pass does to your kernel.
+
+```bash
+FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./dumps python examples/03-tiledMma.py
+```
+
+The output directory will contain:
+
+```
+dumps/gemm_kernel/
+├── 00_original.mlir                # IR immediately after tracing
+├── 01_gpu-kernel-outlining.mlir
+├── 02_fly-canonicalize.mlir        # After Fly canonicalization
+├── 03_fly-layout-lowering.mlir     # Layout algebra fully lowered
+├── 04_convert-fly-to-rocdl.mlir   # Fly ops replaced by ROCDL intrinsics
+├── 05_canonicalize.mlir
+...
+└── final_isa.s                     # AMD ISA assembly (best-effort)
+```
+
+<Tip>
+Compare `02_fly-canonicalize.mlir` and `03_fly-layout-lowering.mlir` side-by-side to see exactly how composition, product, and divide operations expand to arithmetic.
+</Tip>
+
+<Warning>
+`FLYDSL_DUMP_IR=1` automatically disables the disk cache (`FLYDSL_RUNTIME_ENABLE_CACHE=0`). Every invocation will recompile from scratch.
+</Warning>
+
+---
+
+## Source File Reference
+
+| File | Description |
+|---|---|
+| `include/flydsl/Dialect/Fly/IR/FlyDialect.td` | Dialect declaration (`name = "fly"`) |
+| `include/flydsl/Dialect/Fly/IR/FlyOps.td` | All layout, copy, MMA, and memref op definitions |
+| `include/flydsl/Dialect/Fly/IR/FlyTypeDefs.td` | Custom type definitions |
+| `include/flydsl/Dialect/Fly/IR/FlyAttrDefs.td` | Attribute definitions (swizzle, layout, tile, …) |
+| `include/flydsl/Dialect/Fly/Transforms/Passes.td` | Pass declarations |
+| `include/flydsl/Dialect/FlyROCDL/IR/Dialect.td` | FlyROCDL dialect and base type classes |
+| `include/flydsl/Dialect/FlyROCDL/IR/CopyAtom.td` | `BufferCopy`, `BufferCopyLDS`, `BufferAtomic`, `LdsReadTranspose` types |
+| `include/flydsl/Dialect/FlyROCDL/IR/MmaAtom.td` | `MFMA`, `MFMAScale`, `WMMA` types |
+| `python/flydsl/compiler/jit_function.py` | `MlirCompiler` — defines `_pipeline_fragments()` |
+| `tools/` | `fly-opt` source |

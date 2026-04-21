@@ -1,0 +1,309 @@
+---
+title: "Benchmarking FlyDSL Kernels: Throughput and TFLOPS"
+description: "Measure FlyDSL kernel throughput (TB/s) and TFLOPS with run_benchmark.sh, compare against AIter baselines, and tune with waves_per_eu and tile parameters."
+---
+
+FlyDSL's benchmark harness measures the sustained throughput and compute efficiency of its GPU kernels across a range of problem shapes and data types. Results are reported as memory bandwidth (TB/s) and arithmetic throughput (TFLOPS), and can be compared against AIter/CK baselines to assess how close kernels are to roofline performance.
+
+## Running Benchmarks
+
+The primary entry point is `scripts/run_benchmark.sh`. It configures `PYTHONPATH`, auto-selects the GPU with the most available VRAM, detects the GPU architecture, and runs all applicable benchmark groups.
+
+```bash
+bash scripts/run_benchmark.sh
+```
+
+The script supports selective execution by passing op names as positional arguments or with `--only`:
+
+```bash
+bash scripts/run_benchmark.sh softmax             # only softmax
+bash scripts/run_benchmark.sh gemm moe            # GEMM and MoE
+bash scripts/run_benchmark.sh --only softmax,layernorm
+bash scripts/run_benchmark.sh --list              # list available ops
+```
+
+Available ops: `softmax`, `layernorm`, `rmsnorm`, `gemm`, `moe`.
+
+<Note>
+  GEMM and MoE benchmarks run only on CDNA architectures (gfx9xx) because they rely on MFMA instructions. On RDNA4 (gfx120x), the script runs a dedicated WMMA GEMM sweep instead.
+</Note>
+
+## What the Benchmarks Measure
+
+Each benchmark kernel is run with 10 warm-up iterations followed by 100 timed iterations. Timing uses PyTorch CUDA events to measure device-side execution time exclusively, avoiding host-side Python overhead.
+
+| Metric | Description |
+|---|---|
+| **TB/s** | Effective memory bandwidth: total bytes moved divided by kernel time |
+| **TFLOPS** | Arithmetic throughput: total floating-point operations divided by kernel time |
+
+For memory-bound problem sizes (small M or token counts ≤ 512), bandwidth (TB/s) is the primary figure of merit. For compute-bound sizes, TFLOPS is the relevant metric.
+
+## Available Benchmark Groups
+
+<CardGroup cols={2}>
+  <Card title="Softmax" icon="wave-sine">
+    Benchmarks row-wise softmax over shapes such as `32768x8192` in `bf16`. Override shapes with `ROCDSL_SOFTMAX_SHAPES`.
+  </Card>
+  <Card title="LayerNorm & RMSNorm" icon="ruler">
+    Benchmarks layer and RMS normalization. Override shapes with `ROCDSL_LAYERNORM_SHAPES` or `ROCDSL_RMSNORM_SHAPES`.
+  </Card>
+  <Card title="Preshuffle GEMM" icon="table-cells">
+    MFMA-based GEMM in fp8, int8, int4, bf16, and fp4 (gfx950 only). Includes standard and async-copy variants with configurable tile sizes and `waves_per_eu`.
+  </Card>
+  <Card title="Mixture-of-Experts" icon="network-wired">
+    MoE 2-stage GEMM in fp8, fp4 (gfx950), and W4A16 groupwise (int4_bf16). Reports separate stage-1 and stage-2 rows.
+  </Card>
+</CardGroup>
+
+### Default Benchmark Shapes
+
+**Softmax / LayerNorm / RMSNorm** — format: `M,N,dtype`
+
+```
+32768,8192,bf16
+```
+
+**Preshuffle GEMM** — format: `dtype,M,N,K,tile_m,tile_n,tile_k`
+
+```
+fp8,16,40960,5120,16,128,256
+fp8,16,77824,5120,16,128,256
+fp8,5120,5120,8320,64,256,128
+fp8,9728,8192,8320,64,256,128
+int8,9728,8192,8320,64,256,128
+int4,9728,8192,8320,64,256,128
+bf16,5120,5120,8320,64,256,128
+```
+
+**FP4 GEMM (gfx950 only)** — format: `M,N,K,tile_m,tile_n,tile_k`
+
+```
+8192,8192,8192,64,128,256
+8192,8192,8192,64,256,256
+8192,8192,8192,128,256,256
+8192,8192,8192,128,256,128
+```
+
+**MoE** — format: `tokens,model_dim,inter_dim,experts,topk,tile_m,tile_n,tile_k,tile_n2,tile_k2`
+
+```
+32768,8192,8192,16,4,64,128,128,256,128
+64,6144,1024,128,8,16,64,256,64,256
+```
+
+## Interpreting Benchmark Output
+
+The script prints a fixed-width table to stdout. Each row corresponds to one (op, shape, dtype) combination.
+
+```
+op             shape                              dtype       TB/s    TFLOPS
+-------------- ---------------------------------- ---------- ---------- ----------
+gemm           16x40960x5120_tile16x128x256       fp8         1.234     56.789
+gemm_async     5120x5120x8320_tile128x256x128_2tg fp8         1.567     89.012
+moe_gemm1      t32768-d8192x8192-e16k4            fp8         1.100     45.600
+moe_gemm2      t32768-d8192x8192-e16k4            fp8         0.980     40.200
+softmax        32768x8192                         bf16        2.345     -
+```
+
+- A `-` in TFLOPS for norm/softmax ops means the metric is not reported for that op type.
+- `skip` in both columns means the kernel was skipped due to an unsupported architecture (e.g., FP4 on non-gfx950 hardware).
+- Benchmark logs are written to `${BENCH_LOG_DIR:-/tmp/flydsl_bench}/` for post-hoc inspection.
+
+## Running Individual Benchmark Scripts
+
+You can invoke the underlying kernel test scripts directly to benchmark a single configuration without going through the harness:
+
+<Steps>
+  <Step title="GEMM benchmark — single shape">
+    ```bash
+    python3 tests/kernels/test_preshuffle_gemm.py \
+        --in_dtype fp8 \
+        -M 5120 -N 5120 -K 8320 \
+        --tile_m 64 --tile_n 256 --tile_k 128 \
+        --num_warmup 10 \
+        --num_iters 100
+    ```
+  </Step>
+  <Step title="GEMM with async copy and waves_per_eu">
+    ```bash
+    python3 tests/kernels/test_preshuffle_gemm.py \
+        --in_dtype fp8 \
+        -M 9728 -N 8192 -K 8320 \
+        --tile_m 128 --tile_n 256 --tile_k 128 \
+        --use_async_copy \
+        --waves_per_eu 2 \
+        --num_warmup 10 \
+        --num_iters 100
+    ```
+  </Step>
+  <Step title="MoE benchmark — custom topology">
+    ```bash
+    python3 tests/kernels/test_moe_gemm.py \
+        --in_dtype fp8 \
+        -dim 8192,8192 \
+        -t 32768 \
+        -e 16 \
+        -k 4 \
+        --tile_m 64 --tile_n 128 --tile_k 128 \
+        --tile_n2 256 --tile_k2 128 \
+        --num_warmup 10 \
+        --num_iters 100
+    ```
+  </Step>
+  <Step title="Softmax / LayerNorm benchmark">
+    ```bash
+    ROCDSL_SOFTMAX_SHAPES="32768,8192,bf16" python3 tests/kernels/test_softmax.py
+    ROCDSL_LAYERNORM_SHAPES="32768,8192,bf16" python3 tests/kernels/test_layernorm.py
+    ```
+  </Step>
+</Steps>
+
+## Performance Tuning
+
+Several compile-time parameters directly affect occupancy and throughput. These are passed as CLI arguments to the kernel test scripts or set as environment variables consumed by the benchmark harness.
+
+### `waves_per_eu`
+
+`waves_per_eu` controls how many wavefronts the scheduler targets per execution unit. Higher values increase occupancy and can hide latency, but also increase register pressure and may lower peak VGPR usage per wave.
+
+```bash
+# Test with 2 waves per EU (common for large GEMM tiles)
+python3 tests/kernels/test_preshuffle_gemm.py \
+    --in_dtype fp8 -M 9728 -N 8192 -K 8320 \
+    --tile_m 128 --tile_n 256 --tile_k 128 \
+    --waves_per_eu 2
+```
+
+The async-copy GEMM shapes in `run_benchmark.sh` use `GEMM_WAVES_PER_EU=2` by default. Override at the environment level:
+
+```bash
+GEMM_WAVES_PER_EU=4 bash scripts/run_benchmark.sh gemm
+```
+
+### `maxnreg` (register cap)
+
+Capping the maximum number of registers per thread can increase occupancy by allowing more wavefronts to reside on a CU simultaneously. This is a trade-off: more occupancy at the cost of potential register spilling. Set this via kernel launch configuration in the test or kernel source.
+
+### `num_warps` / block size
+
+The number of wavefronts per workgroup (block) determines how LDS is partitioned and how MMA tiles map to hardware. Typical GEMM kernels use 4 wavefronts (256 threads with wave-size 64 on CDNA, or 128 threads with wave-size 32 on RDNA4).
+
+<Tip>
+  For memory-bound problem sizes (small M or token counts), increasing `waves_per_eu` is usually more impactful than changing tile dimensions. For compute-bound sizes, maximize the tile area first and then tune occupancy.
+</Tip>
+
+### Tile Size Selection
+
+Tile parameters `tile_m`, `tile_n`, `tile_k` partition the GEMM problem across the block, warp, and instruction hierarchy.
+
+| Guideline | Recommendation |
+|---|---|
+| Decode / small-batch (M ≤ 16) | Small `tile_m` (16), large `tile_n` (128–256), large `tile_k` |
+| Prefill / large-batch | `tile_m` 64–128, `tile_n` 256, `tile_k` 128 |
+| FP4 on gfx950 | `tile_n` 128–256, `tile_k` 256 for higher arithmetic intensity |
+
+## JIT Cache and Benchmarking
+
+FlyDSL caches compiled kernels to disk under `~/.flydsl/cache/`. The cache key includes the kernel source and all closure values, so correctness is maintained across runs. However, when modifying C++ compiler passes or non-closure helper functions that the cache key does not cover, stale artifacts can produce misleading benchmark numbers.
+
+```bash
+# Disable disk cache for a benchmark run
+FLYDSL_RUNTIME_ENABLE_CACHE=0 bash scripts/run_benchmark.sh gemm
+```
+
+The in-memory cache within a single process session is unaffected by this flag, so repeated calls within one run still benefit from caching.
+
+To clear the disk cache entirely:
+
+```bash
+rm -rf ~/.flydsl/cache
+```
+
+<Warning>
+  Never compare benchmark results taken with and without the JIT cache as a performance signal. The compilation overhead on a cold-cache run is substantial and will dominate the measured time for short-running kernels.
+</Warning>
+
+## Inspecting Generated Code with `FLYDSL_DUMP_IR`
+
+When a benchmark result is unexpected, dumping the MLIR IR at each compilation stage can reveal missed optimizations, incorrect lowerings, or unexpected instruction selection.
+
+```bash
+FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./bench_dumps \
+    python3 tests/kernels/test_preshuffle_gemm.py \
+    --in_dtype fp8 -M 5120 -N 5120 -K 8320
+```
+
+This writes numbered `.mlir` files for each pass stage and a `final_isa.s` assembly file to `./bench_dumps/`. Enabling `FLYDSL_DUMP_IR` also disables the disk cache so the full pipeline runs every time.
+
+<Accordion title="Pipeline stages visible in IR dumps">
+The `MlirCompiler` pipeline applies these stages in order, each of which produces a dump file when `FLYDSL_DUMP_IR=1`:
+
+1. `gpu-kernel-outlining`
+2. `fly-canonicalize`
+3. `fly-layout-lowering`
+4. `convert-fly-to-rocdl`
+5. `canonicalize` + `cse`
+6. `convert-gpu-to-rocdl` (inside `gpu.module`)
+7. `rocdl-attach-target` (sets `chip=gfxNNN`)
+8. `gpu-to-llvm` → `convert-arith/func-to-llvm`
+9. `gpu-module-to-binary` → fatbin
+
+Check the stage just before a failure or unexpected instruction to isolate which pass is responsible.
+</Accordion>
+
+## Writing Custom Benchmarks
+
+Use `bench_gpu_us_torch` from `tests/kernels/benchmark_common.py` to time any kernel invocation with PyTorch CUDA events:
+
+```python
+from tests.kernels.benchmark_common import bench_gpu_us_torch
+
+def benchmark_my_kernel(M, N, K):
+    # Compile and set up inputs
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C = torch.empty(M, N, device="cuda", dtype=torch.float32)
+
+    launch_fn = compile_my_kernel(M, N, K)
+
+    def run():
+        launch_fn(A, B, C)
+
+    gpu_us = bench_gpu_us_torch(run, warmup=20, iters=200)
+
+    # Compute metrics
+    total_flops = 2 * M * N * K
+    tflops = total_flops / (gpu_us * 1e-6) / 1e12
+
+    total_bytes = (M * K + K * N + M * N) * 2  # fp16
+    tbps = total_bytes / (gpu_us * 1e-6) / 1e12
+
+    print(f"Time: {gpu_us:.1f} us  TFLOPS: {tflops:.3f}  TB/s: {tbps:.3f}")
+```
+
+The `perftest` decorator in `tests/test_common.py` provides a higher-level alternative that handles device memory profiling, rotation count selection for cache-aware measurement, and optional HIPGraph capture:
+
+```python
+from tests.test_common import perftest
+
+@perftest(num_iters=20, num_warmup=3, testGraph=False)
+def my_kernel_perf(Input, Output):
+    launch_my_kernel(Input, Output)
+```
+
+## Environment Variables for Benchmarking
+
+| Variable | Description |
+|---|---|
+| `BENCH_LOG_DIR` | Directory for benchmark log files (default: `/tmp/flydsl_bench`) |
+| `FLYDSL_RUNTIME_ENABLE_CACHE` | Set to `0` to disable disk cache during benchmarking |
+| `FLYDSL_DUMP_IR` | Set to `1` to dump MLIR IR at each pipeline stage |
+| `FLYDSL_DUMP_DIR` | Directory for IR dump files (default: `~/.flydsl/debug`) |
+| `GEMM_WAVES_PER_EU` | Override `waves_per_eu` for async GEMM shapes in `run_benchmark.sh` |
+| `GEMM_USE_ASYNC_COPY` | Set to `0` to disable async copy for GEMM shapes (default: `1`) |
+| `GEMM_FP4_WAVES_PER_EU` | Override `waves_per_eu` for FP4 async GEMM shapes (default: `2`) |
+| `ROCDSL_SOFTMAX_SHAPES` | Override softmax benchmark shapes (`"M,N,dtype"`) |
+| `ROCDSL_LAYERNORM_SHAPES` | Override layernorm benchmark shapes |
+| `ROCDSL_RMSNORM_SHAPES` | Override RMSNorm benchmark shapes |
+| `HIP_VISIBLE_DEVICES` | Pin benchmarks to a specific GPU; auto-selected if unset |

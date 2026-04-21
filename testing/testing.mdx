@@ -1,0 +1,298 @@
+---
+title: "Running FlyDSL Tests: GPU Kernels, MLIR Lit, and Unit Tests"
+description: "Run FlyDSL GPU kernel tests, MLIR lit tests, and unit tests using run_tests.sh, pytest markers, and environment variables on AMD ROCm hardware."
+---
+
+FlyDSL ships a multi-layered test suite that covers everything from CPU-only layout algebra verification to full end-to-end GPU kernel execution. Tests are organized by dependency tier so you can run fast compile-only checks without a GPU, or gate on real hardware for correctness validation against PyTorch references.
+
+## Prerequisites
+
+Before running any tests, ensure FlyDSL is built and installed:
+
+```bash
+bash scripts/build_llvm.sh -j64   # one-time: build LLVM/MLIR
+bash scripts/build.sh -j64        # build FlyDSL (C++ + Python bindings)
+pip install -e .                   # install in dev mode
+```
+
+If you prefer not to install, export the paths manually:
+
+```bash
+export PYTHONPATH="${PWD}/build-fly/python_packages:${PWD}:${PYTHONPATH}"
+export LD_LIBRARY_PATH="${PWD}/build-fly/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH}"
+```
+
+## Running the Full Test Suite
+
+The quickest way to verify a build is the provided shell script, which sets up `PYTHONPATH`, `LD_LIBRARY_PATH`, auto-selects the GPU with the most free VRAM, and runs pytest plus standalone example scripts and MLIR FileCheck tests in sequence.
+
+```bash
+bash scripts/run_tests.sh
+```
+
+By default this skips tests marked `large_shape` for fast iteration. To run every parametrized case:
+
+```bash
+RUN_TESTS_FULL=1 bash scripts/run_tests.sh
+```
+
+The script exits immediately on the first failure (`set -euo pipefail`).
+
+## Test Categories
+
+FlyDSL's tests are divided into four categories based on what they require to run.
+
+<CardGroup cols={2}>
+  <Card title="MLIR Lit Tests" icon="file-code">
+    `tests/mlir/` — FileCheck tests driven by `fly-opt`. Verify Fly dialect lowering without a GPU.
+  </Card>
+  <Card title="Python / AOT Tests" icon="python">
+    `tests/python/examples/` — Python-based MLIR generation and AOT pre-compilation examples.
+  </Card>
+  <Card title="GPU Kernel Tests" icon="microchip">
+    `tests/kernels/test_*.py` — Full compile → GPU launch → PyTorch reference validation.
+  </Card>
+  <Card title="Unit Tests" icon="vials">
+    `tests/unit/` — Compile-tier unit tests, mixed L0 through L2 tiers.
+  </Card>
+</CardGroup>
+
+### GPU Kernel Test Files
+
+Each file in `tests/kernels/` targets a specific kernel family. All require a compatible AMD GPU.
+
+| Test File | Kernel | Description |
+|---|---|---|
+| `test_preshuffle_gemm.py` | Preshuffle GEMM | FP8, INT8, INT4, BF16, FP4 preshuffle MFMA GEMM |
+| `test_blockscale_preshuffle_gemm.py` | Blockscale GEMM | Block-scale (MXFP4) preshuffle GEMM |
+| `test_hgemm_splitk.py` | HGEMM Split-K | FP16 GEMM with split-K reduction |
+| `test_moe_gemm.py` | MoE GEMM | Mixture-of-Experts 2-stage GEMM (gate/up + reduce) |
+| `test_moe_blockscale.py` | MoE Blockscale | MoE blockscale 2-stage |
+| `test_moe_reduce.py` | MoE Reduce | MoE reduction kernel |
+| `test_pa.py` | PagedAttention | Paged attention decode (FP8) — WIP perf tuning |
+| `test_flash_attn_func.py` | FlashAttention | Flash attention — WIP perf tuning |
+| `test_layernorm.py` | LayerNorm | Layer normalization (layout API) |
+| `test_rmsnorm.py` | RMSNorm | RMS normalization (layout API) |
+| `test_softmax.py` | Softmax | Row-wise softmax (layout API) |
+| `test_fused_rope_cache.py` | Fused RoPE | Fused RoPE + KV cache update |
+| `test_allreduce.py` | AllReduce | Multi-GPU all-reduce |
+| `test_rdna_gemm.py` | RDNA GEMM | RDNA FP16/FP8 GEMM |
+| `test_gemm_fp8fp4_gfx1250.py` | GFX1250 GEMM | GFX1250 FP8/FP4 GEMM |
+| `test_wmma_gemm_gfx1250.py` | WMMA GEMM | GFX1250 WMMA GEMM |
+| `test_vec_add.py` | VecAdd | Vector addition (C = A + B) |
+| `test_quant.py` | Quantization | Quantization utilities and ops |
+
+### MLIR Lit Tests
+
+MLIR tests are verified with `fly-opt` + `FileCheck`. They run without a GPU and are organized into three subdirectories.
+
+| Directory | Files | What is Verified |
+|---|---|---|
+| `tests/mlir/LayoutAlgebra/` | `coalesce.mlir`, `composition.mlir`, `construction.mlir`, `coordinate.mlir`, `divide.mlir`, `int_tuple.mlir`, `product.mlir`, `size_cosize.mlir` | Layout algebra operations |
+| `tests/mlir/Conversion/` | `gpu_ops.mlir`, `memref_alloca.mlir`, `memref_ops.mlir`, `mma_atom.mlir`, `pointer_ops.mlir`, `type_conversion.mlir` | Dialect conversion passes |
+| `tests/mlir/Transforms/` | `canonicalize.mlir`, `layout_lowering.mlir` | Transformation passes |
+
+To run a single MLIR test manually (after building `fly-opt`):
+
+```bash
+cmake --build build-fly --target fly-opt -j$(nproc)
+build-fly/bin/fly-opt --fly-canonicalize tests/mlir/LayoutAlgebra/construction.mlir
+```
+
+## Running Specific Tests with pytest
+
+<Steps>
+  <Step title="Set up PYTHONPATH">
+    From the repository root, export the build package paths (skip if you used `pip install -e .`):
+
+    ```bash
+    export PYTHONPATH="${PWD}/build-fly/python_packages:${PWD}:${PYTHONPATH}"
+    export LD_LIBRARY_PATH="${PWD}/build-fly/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH}"
+    ```
+  </Step>
+  <Step title="Run a specific test file">
+    Pass the file path directly to pytest:
+
+    ```bash
+    python3 -m pytest tests/kernels/test_softmax.py -v
+    python3 -m pytest tests/kernels/test_preshuffle_gemm.py -v
+    ```
+  </Step>
+  <Step title="Filter by pytest marker">
+    Use `-m` to select tests by tier or shape size:
+
+    ```bash
+    # Only GPU execution tests
+    python3 -m pytest tests/ -m "l2_device" -v
+
+    # Skip large shapes (fast local iteration)
+    python3 -m pytest tests/ -m "not large_shape" -v
+
+    # Compile-tier only — no GPU required
+    python3 -m pytest tests/ -m "l0_backend_agnostic or l1a_compile_no_target_dialect" -v
+    ```
+  </Step>
+  <Step title="Run a kernel test directly">
+    Some test files accept CLI arguments for quick ad-hoc runs:
+
+    ```bash
+    python3 tests/kernels/test_softmax.py
+    python3 tests/kernels/test_preshuffle_gemm.py --in_dtype fp8 -M 16 -N 5120 -K 8192
+    ```
+  </Step>
+</Steps>
+
+### GEMM Test CLI Options
+
+`test_preshuffle_gemm.py` supports extensive configuration at the command line:
+
+```bash
+python3 tests/kernels/test_preshuffle_gemm.py \
+    --in_dtype fp8 \
+    -M 16 -N 5120 -K 8192 \
+    --tile_m 16 --tile_n 128 --tile_k 256 \
+    --lds_stage 2 \
+    --num_iters 20 \
+    --num_warmup 3 \
+    --no_aiter_bench \
+    --test_graph        # enable HIPGraph capture mode
+    --wfp4              # FP4 weight path (gfx950 only)
+```
+
+## Pytest Markers
+
+Markers are declared in `tests/pytest.ini` and correspond to the test tiering model described in `tests/README.md`.
+
+| Marker | Tier | Requires GPU |
+|---|---|---|
+| `l0_backend_agnostic` | L0 | No |
+| `l1a_compile_no_target_dialect` | L1a | No |
+| `l1b_target_dialect` | L1b | No |
+| `l2_device` | L2 | Yes |
+| `rocm_lower` | L1b/L2 | Paired with above |
+| `large_shape` | Any | Yes — skipped by default |
+| `multi_gpu` | L2 | Requires ≥4 GPUs |
+| `benchmark` | Any | Longer runtime |
+
+<Note>
+  `rocm_lower` is always used in conjunction with `l1b_target_dialect` or `l2_device`; it signals that the test assumes the ROCDL lowering path specifically.
+</Note>
+
+## Environment Variables
+
+These variables are the authoritative names from `python/flydsl/utils/env.py`. Do not use alternate spellings in scripts.
+
+| Variable | Description |
+|---|---|
+| `PYTHONPATH` | Must include `build-fly/python_packages` and the repo root |
+| `FLYDSL_RUNTIME_ENABLE_CACHE` | Set to `0` or `false` to disable the JIT disk cache (in-memory cache stays active) |
+| `FLYDSL_DUMP_IR` | Set to `1` to dump intermediate MLIR at each pipeline stage |
+| `FLYDSL_DUMP_DIR` | Directory for IR dump files (default: `~/.flydsl/debug`) |
+| `FLYDSL_RUNTIME_CACHE_DIR` | JIT cache directory (default: `~/.flydsl/cache`) |
+| `FLYDSL_COMPILE_BACKEND` | Compile backend ID (default: `rocm`) |
+| `ARCH` | Override GPU arch for compilation (e.g., `gfx942`) |
+| `COMPILE_ONLY` | Compile without executing on device |
+| `RUN_TESTS_FULL` | Set to `1` in `run_tests.sh` to include `large_shape` tests |
+| `ROCDSL_SOFTMAX_SHAPES` | Override softmax test shapes (`"M,N,dtype;..."`) |
+| `ROCDSL_LAYERNORM_SHAPES` | Override layernorm test shapes |
+
+<Tip>
+  When iterating on kernel source code, `FLYDSL_RUNTIME_ENABLE_CACHE=0` prevents the JIT from returning stale compiled artifacts. The in-memory cache for the current process is unaffected, so compilation still benefits from caching within a single test session.
+</Tip>
+
+## IR Dump Workflow
+
+Dumping the MLIR IR at every pipeline stage is useful for debugging compilation failures or verifying that passes fire correctly.
+
+```bash
+FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./dumps python3 tests/kernels/test_preshuffle_gemm.py
+```
+
+This produces numbered `.mlir` files — one per pipeline stage — plus a `final_isa.s` assembly file in `FLYDSL_DUMP_DIR`. A dedicated helper script is also available:
+
+```bash
+bash scripts/dumpir.sh
+```
+
+<Note>
+  Setting `FLYDSL_DUMP_IR=1` implicitly disables the disk cache so every invocation recompiles and produces fresh IR output.
+</Note>
+
+## Verified Platforms
+
+The test suite is validated on the following AMD hardware:
+
+| Platform | GPU Architecture | Wave Size | Key Feature |
+|---|---|---|---|
+| AMD MI300X / MI308X | gfx942 (CDNA3) | 64 | BufferCopy, preshuffle GEMM |
+| AMD MI350 / MI355X | gfx950 (CDNA4) | 64 | MFMA_SCALE, FP4, 160 KB LDS |
+| AMD MI450 | gfx1250 | 32 | TDM ops, FP8/FP4 GEMM, multi-stage pipeline |
+| Radeon AI PRO R9700 | gfx1201 (RDNA4) | 32 | WMMA GEMM |
+
+All platforms run Linux with ROCm 6.x or 7.x.
+
+## Writing New Tests
+
+<Accordion title="PyIR test pattern (no GPU required)">
+Use this pattern for testing layout operations and MLIR IR generation without a device:
+
+```python
+# tests/python/test_my_feature.py
+import flydsl.expr as fx
+from flydsl.expr.typing import T
+
+def test_my_layout_op(ctx, insert_point):
+    shape = fx.make_shape(4, 8)
+    stride = fx.make_stride(8, 1)
+    layout = fx.make_layout(shape, stride)
+    result = fx.size(layout)
+    ir_str = str(ctx.module)
+    assert "fly.make_layout" in ir_str
+```
+
+The `ctx` and `insert_point` fixtures are provided by `tests/conftest.py` and set up a fresh MLIR context with all Fly dialect operations registered.
+</Accordion>
+
+<Accordion title="GPU kernel test pattern">
+Use this pattern for full end-to-end kernel tests that compile, launch, and validate on device:
+
+```python
+# tests/kernels/test_my_kernel.py
+import torch
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import arith, gpu
+from tests.test_common import checkAllclose
+
+@flyc.kernel
+def my_kernel(A: fx.Tensor, B: fx.Tensor, N: fx.Constexpr[int]):
+    tid = gpu.thread_idx.x
+    bid = gpu.block_idx.x
+    # ... kernel body ...
+
+@flyc.jit
+def launch(A: fx.Tensor, B: fx.Tensor, N: fx.Constexpr[int],
+           stream: fx.Stream = fx.Stream(None)):
+    my_kernel(A, B, N).launch(grid=(N // 256,), block=(256,), stream=stream)
+
+def test_my_kernel():
+    N = 1024
+    A = torch.randn(N, device="cuda", dtype=torch.float32)
+    B = torch.empty(N, device="cuda", dtype=torch.float32)
+    launch(A, B, N)
+    ref = A  # or compute a reference
+    err = checkAllclose(B, ref, rtol=1e-2, atol=1e-2)
+    assert err == 0, f"Mismatch: {err * 100:.2f}%"
+```
+
+`checkAllclose` returns a mismatch ratio in [0, 1]; 0 means all elements are within tolerance.
+</Accordion>
+
+## Test Utility Reference
+
+| File | Key Exports | Description |
+|---|---|---|
+| `tests/conftest.py` | `ctx`, `module`, `insert_point` fixtures | MLIR context setup for PyIR tests |
+| `tests/test_common.py` | `perftest()`, `checkAllclose()`, `verify_output()` | Performance decorator and correctness helpers |
+| `tests/utils.py` | `compile_to_hsaco()`, `pertoken_quant()`, `shuffle_weight()` | Standalone compilation path and weight utilities |
+| `tests/kernels/benchmark_common.py` | `bench_gpu_us_torch()` | GPU timing via torch CUDA events |

@@ -1,0 +1,450 @@
+---
+title: "Fly Dialect Layout Operations: Complete API Reference"
+description: "Reference for Fly layout ops: construction, coordinate mapping, algebra, products, divides, and structural ops with Python API and MLIR examples."
+---
+
+The Fly dialect implements the CuTe layout algebra for AMD ROCm GPUs. Every layout function in `flydsl.expr` (`fx.*`) traces to a corresponding `fly.*` MLIR op during kernel compilation. This page is the authoritative mapping between the Python API and the underlying dialect.
+
+<Note>
+All `fx.*` layout calls **must** appear inside a `@flyc.kernel` or `@flyc.jit` body. Calling them at module scope or inside a plain Python function will raise an error because they require an active MLIR insertion point.
+</Note>
+
+---
+
+## Quick-Reference Table
+
+| Python API | Fly Dialect Op | Description |
+|---|---|---|
+| `fx.make_shape(8, 16)` | `fly.make_shape` | Create shape IntTuple |
+| `fx.make_stride(1, 8)` | `fly.make_stride` | Create stride IntTuple |
+| `fx.make_layout(shape, stride)` | `fly.make_layout` | Layout from (shape, stride) |
+| `fx.make_coord(i, j)` | `fly.make_coord` | Coordinate IntTuple |
+| `fx.make_int_tuple(elems)` | `fly.make_int_tuple` | Generic IntTuple |
+| `fx.make_ordered_layout(shape, order)` | `fly.make_ordered_layout` | Layout with explicit stride order |
+| `fx.make_identity_layout(shape)` | `fly.make_identity_layout` | Identity layout (stride = prefix products of shape) |
+| `fx.crd2idx(coord, layout)` | `fly.crd2idx` | Coordinate → linear index |
+| `fx.idx2crd(idx, layout)` | `fly.idx2crd` | Linear index → coordinate |
+| `fx.size(x)` | `fly.size` | Product of all dimensions |
+| `fx.cosize(layout)` | `fly.cosize` | Codomain size (max index + 1) |
+| `fx.get_shape(layout)` | `fly.get_shape` | Extract shape from layout |
+| `fx.get_stride(layout)` | `fly.get_stride` | Extract stride from layout |
+| `fx.get(it, i)` | `fly.select` + `fly.get_scalar` | Extract element at index |
+| `fx.get_scalar(it)` | `fly.get_scalar` | Extract scalar from leaf IntTuple |
+| `fx.select(it, indices)` | `fly.select` | Select modes by index list |
+| `fx.composition(A, B)` | `fly.composition` | Compose A ∘ B |
+| `fx.complement(ly, sz)` | `fly.complement` | Complement of layout |
+| `fx.coalesce(ly)` | `fly.coalesce` | Simplify / flatten layout |
+| `fx.right_inverse(ly)` | `fly.right_inverse` | Right inverse of layout |
+| `fx.left_inverse(ly)` | `fly.left_inverse` | Left inverse of layout |
+| `fx.logical_product(A, B)` | `fly.logical_product` | Mode-wise product |
+| `fx.zipped_product(A, B)` | `fly.zipped_product` | Zipped product |
+| `fx.tiled_product(A, B)` | `fly.tiled_product` | Tiled product |
+| `fx.flat_product(A, B)` | `fly.flat_product` | Flat product |
+| `fx.raked_product(A, B)` | `fly.raked_product` | Raked/interleaved product |
+| `fx.block_product(A, B)` | `fly.blocked_product` | Blocked product |
+| `fx.logical_divide(A, tiler)` | `fly.logical_divide` | Basic divide |
+| `fx.zipped_divide(A, tiler)` | `fly.zipped_divide` | Zipped divide |
+| `fx.tiled_divide(A, tiler)` | `fly.tiled_divide` | Tiled divide |
+| `fx.flat_divide(A, tiler)` | `fly.flat_divide` | Flat divide |
+| `fx.group(it, begin, end)` | `fly.group` | Group modes into nested tuple |
+| `fx.append(base, elem)` | `fly.append` | Append mode |
+| `fx.prepend(base, elem)` | `fly.prepend` | Prepend mode |
+| `fx.slice(src, coord)` | `fly.slice` | Slice at coordinate |
+| `fx.dice(src, coord)` | `fly.dice` | Dice IntTuple/layout at coord |
+| `fx.recast_layout(ly, old, new)` | `fly.recast_layout` | Adjust layout for type-width change |
+
+---
+
+## Construction
+
+### `make_shape` / `make_stride` / `make_coord` / `make_int_tuple`
+
+These four ops all produce `!fly.int_tuple`. Static elements are folded into the type; dynamic elements become SSA operands.
+
+```python
+import flydsl.expr as fx
+
+shape  = fx.make_shape(8, 16)          # !fly.int_tuple<(8, 16)>
+stride = fx.make_stride(1, 8)          # !fly.int_tuple<(1, 8)>
+coord  = fx.make_coord(row, col)        # dynamic: !fly.int_tuple<(?, ?)>
+it     = fx.make_int_tuple((4, 8, 2))  # !fly.int_tuple<(4, 8, 2)>
+```
+
+```mlir
+%shape  = fly.make_shape()     : !fly.int_tuple<(8, 16)>
+%stride = fly.make_stride()    : !fly.int_tuple<(1, 8)>
+%coord  = fly.make_coord(%row, %col : i32, i32) : !fly.int_tuple<(?, ?)>
+```
+
+### `make_layout`
+
+Combines a shape and a stride IntTuple into a `!fly.layout`.
+
+```python
+layout = fx.make_layout(shape, stride)
+
+# Shorthand — Python tuples are auto-materialized
+layout = fx.make_layout((8, 16), (1, 8))
+```
+
+```mlir
+%ly = fly.make_layout(%shape, %stride)
+    : (!fly.int_tuple<(8, 16)>, !fly.int_tuple<(1, 8)>) -> !fly.layout<(8, 16):(1, 8)>
+```
+
+### `make_ordered_layout`
+
+Constructs a compact row-major or column-major layout by specifying the ordering of stride modes rather than the strides themselves.
+
+```python
+# Column-major (M-first): order=(0, 1) means stride[0] < stride[1]
+col_major = fx.make_ordered_layout((M, N), order=(0, 1))
+
+# Row-major (N-first)
+row_major = fx.make_ordered_layout((M, N), order=(1, 0))
+```
+
+```mlir
+%col = fly.make_ordered_layout(%shape, %order)
+    : (!fly.int_tuple<(?, ?)>, !fly.int_tuple<(0, 1)>) -> !fly.layout<(?, ?):(1, ?)>
+```
+
+### `make_identity_layout`
+
+Produces the identity layout for a given shape: strides are the prefix products of the shape (column-major dense layout).
+
+```python
+id_ly = fx.make_identity_layout((4, 8))  # layout (4, 8):(1, 4)
+```
+
+---
+
+## Coordinate Mapping
+
+### `crd2idx`
+
+Maps a logical coordinate to a physical linear index using the formula `index = sum(coord_i * stride_i)`.
+
+```python
+idx = fx.crd2idx(coord, layout)
+
+# Pass a Python tuple directly — it will be materialized as a coord
+idx = fx.crd2idx((3, 5), layout)  # 3*1 + 5*8 = 43 for layout (8,16):(1,8)
+```
+
+```mlir
+%idx = fly.crd2idx(%coord, %layout)
+    : (!fly.int_tuple<(3, 5)>, !fly.layout<(8, 16):(1, 8)>) -> !fly.int_tuple<43>
+```
+
+### `idx2crd`
+
+Inverse of `crd2idx`: recovers a coordinate from a flat linear index.
+
+```python
+coord = fx.idx2crd(43, layout)  # → (3, 5) for layout (8,16):(1,8)
+```
+
+```mlir
+%coord = fly.idx2crd(%idx, %layout)
+    : (!fly.int_tuple<43>, !fly.layout<(8, 16):(1, 8)>) -> !fly.int_tuple<(3, 5)>
+```
+
+---
+
+## Query Operations
+
+### `size`
+
+Returns the product of all shape dimensions as an IntTuple (scalar for static layouts, SSA for dynamic).
+
+```python
+s = fx.size(layout)    # size((8, 16):(1, 8)) = 128
+s = fx.size(shape)     # works on bare IntTuple too
+```
+
+### `cosize`
+
+Returns the codomain size: the maximum index reachable by the layout plus one. For dense non-overlapping layouts this equals `size`. For strided or permuted layouts it may be larger.
+
+```python
+cs = fx.cosize(layout)
+```
+
+### `get_shape` / `get_stride`
+
+Extract the shape or stride component of a layout as an IntTuple.
+
+```python
+shape  = fx.get_shape(layout)
+stride = fx.get_stride(layout)
+```
+
+### `get` / `get_scalar` / `select`
+
+```python
+# get(x, i): extract mode i — emits fly.select + fly.get_scalar
+first_dim = fx.get(shape, 0)    # returns index-typed ir.Value
+
+# get_scalar: extract the integer value from a rank-1 leaf IntTuple
+v = fx.get_scalar(leaf_int_tuple)
+
+# select: extract multiple modes by index list
+two_modes = fx.select(shape, indices=[0, 2])
+```
+
+---
+
+## Layout Algebra
+
+### `composition(A, B)`
+
+Composes two layouts sequentially: `result(x) = A(B(x))`.
+
+```python
+composed = fx.composition(layout_a, layout_b)
+```
+
+```mlir
+%c = fly.composition(%a, %b)
+    : (!fly.layout<(8, 16):(1, 8)>, !fly.layout<(4, 4):(1, 4)>)
+    -> !fly.layout<...>
+```
+
+**Use case:** Applying a permutation to a memory layout, or mapping tile coordinates into block coordinates.
+
+### `complement(layout, codomain_size)`
+
+Produces the complementary layout that covers the remaining elements of a codomain of `codomain_size`. The `codomain_size` argument is optional; when omitted the codomain is inferred from the layout's cosize.
+
+```python
+rest = fx.complement(tiler, target_size)
+rest = fx.complement(tiler)  # infer codomain_size
+```
+
+**Use case:** Internal building block for `logical_divide`; useful for computing the "rest" iteration space when tiling.
+
+### `coalesce(layout)`
+
+Simplifies a layout by merging adjacent compatible modes. Preserves both `size(layout)` and the index mapping for all valid coordinates.
+
+```python
+simplified = fx.coalesce(layout)
+```
+
+```mlir
+// Input:  !fly.layout<(4, 2, 8):(1, 4, 8)>
+// Output: !fly.layout<(64):(1)>    (all modes coalesced into one)
+%out = fly.coalesce(%in) : (!fly.layout<(4, 2, 8):(1, 4, 8)>) -> !fly.layout<(64):(1)>
+```
+
+### `right_inverse(layout)` / `left_inverse(layout)`
+
+Compute the right or left inverse of a layout. The right inverse is the primary tool for building thread-value layouts in tiled copy and MMA construction.
+
+```python
+inv  = fx.right_inverse(layout)
+linv = fx.left_inverse(layout)
+```
+
+### `recast_layout(layout, old_bits, new_bits)`
+
+Adjusts a layout when reinterpreting memory as a different element type. For example, if a layout was built for 16-bit elements but the kernel switches to 8-bit elements, the strides must be doubled.
+
+```python
+# Reinterpret a 16-bit layout as 8-bit (strides × 2)
+ly8 = fx.recast_layout(layout_f16, old_type_bits=16, new_type_bits=8)
+
+# Reinterpret a 16-bit layout as 32-bit (strides ÷ 2)
+ly32 = fx.recast_layout(layout_f16, old_type_bits=16, new_type_bits=32)
+```
+
+```mlir
+%out = fly.recast_layout {new_type_bits = 8, old_type_bits = 16} (%src)
+    : (!fly.layout<(128):(1)>) -> !fly.layout<(256):(1)>
+```
+
+---
+
+## Product Operations
+
+Products combine two layouts to form a higher-rank layout. All products take `(layout, tiler)` where `tiler` is a `!fly.layout` or `!fly.tile`.
+
+| Variant | Python | Dialect Op | Result Structure |
+|---|---|---|---|
+| Logical product | `fx.logical_product(A, B)` | `fly.logical_product` | B's modes appended as outer modes of A |
+| Zipped product | `fx.zipped_product(A, B)` | `fly.zipped_product` | Modes interleaved pairwise |
+| Tiled product | `fx.tiled_product(A, B)` | `fly.tiled_product` | Hierarchical tiled grouping |
+| Flat product | `fx.flat_product(A, B)` | `fly.flat_product` | All result modes flattened |
+| Raked product | `fx.raked_product(A, B)` | `fly.raked_product` | Interleaved (raked) distribution |
+| Blocked product | `fx.block_product(A, B)` | `fly.blocked_product` | Blocked distribution |
+
+```python
+# Raked product — used internally by make_layout_tv
+thr_layout = fx.make_layout((4, 1), (1, 1))
+val_layout = fx.make_layout((1, 8), (1, 1))
+layout_mn  = fx.raked_product(thr_layout, val_layout)
+```
+
+```mlir
+%out = fly.raked_product(%layout, %tiler)
+    : (!fly.layout<(4, 1):(1, 1)>, !fly.layout<(1, 8):(1, 1)>)
+    -> !fly.layout<...>
+```
+
+---
+
+## Divide Operations
+
+Divides partition a layout by a tiler to create a two-level view separating the "tile" and "remainder" dimensions. All divides take `(layout, divisor)` where `divisor` is a layout or tile.
+
+| Variant | Python | Dialect Op | Description |
+|---|---|---|---|
+| Logical divide | `fx.logical_divide(A, tiler)` | `fly.logical_divide` | Full mode hierarchy preserved |
+| Zipped divide | `fx.zipped_divide(A, tiler)` | `fly.zipped_divide` | Tile modes zipped together |
+| Tiled divide | `fx.tiled_divide(A, tiler)` | `fly.tiled_divide` | Grouped by tile |
+| Flat divide | `fx.flat_divide(A, tiler)` | `fly.flat_divide` | Tile and remainder flattened |
+
+```python
+# Partition a global tensor into 64×8 blocks, then select block bid
+A  = fx.rocdl.make_buffer_tensor(A_tensor)
+bA = fx.zipped_divide(A, (64, 8))   # shape: ((64, 8), num_blocks)
+bA = fx.slice(bA, (None, bid))       # select block bid
+```
+
+```mlir
+%divided = fly.zipped_divide(%A, %tile)
+    : (!fly.memref<f32, bufferdesc, (M, K):(1, M)>, !fly.tile<(64, 8)>)
+    -> !fly.memref<f32, bufferdesc, ((64, 8), (?, ?)):(...)>
+```
+
+<Tip>
+`zipped_divide` is the most common divide in GEMM kernels: it separates each operand into a tile slice (inner) and a block-index dimension (outer), making it straightforward to select this thread-block's tile with `fx.slice`.
+</Tip>
+
+---
+
+## Structural Operations
+
+### `group(int_tuple, begin, end)`
+
+Groups a range of modes `[begin, end)` into a single nested sub-tuple.
+
+```python
+# (8, 4, 2) → (8, (4, 2))
+grouped = fx.group(shape, begin=1, end=3)
+```
+
+```mlir
+%g = fly.group(%shape) {begin = 1, end = 3}
+    : (!fly.int_tuple<(8, 4, 2)>) -> !fly.int_tuple<(8, (4, 2))>
+```
+
+### `append(base, elem)` / `prepend(base, elem)`
+
+Extend an IntTuple or layout by adding a mode at the end or beginning.
+
+```python
+extended = fx.append(base_shape, new_mode)   # (8, 16) + 4 → (8, 16, 4)
+leading  = fx.prepend(base_shape, new_mode)  # 2 + (8, 16) → (2, 8, 16)
+```
+
+### `select(int_tuple, indices)`
+
+Extract specific modes by index. Unlike `get`, `select` preserves the tuple structure and can return multiple modes.
+
+```python
+# Pick modes 0 and 2 from a 3-mode tuple
+selected = fx.select(shape, indices=[0, 2])  # (8, _, 16) → (8, 16)
+```
+
+### `slice(src, coord)` / `dice(src, coord)`
+
+`slice` fixes one or more modes of a layout or memref at a coordinate, reducing its rank. `None` in the coordinate means "keep this mode free." `dice` is a lower-level variant operating only on IntTuple and Layout.
+
+```python
+# Fix the second mode at bid, keep the first free
+block_slice = fx.slice(divided_tensor, (None, bid))
+```
+
+```mlir
+%sliced = fly.slice(%src, %coord)
+    : (!fly.memref<...>, !fly.int_tuple<(None, ?)>) -> !fly.memref<...>
+```
+
+---
+
+## IntTuple Arithmetic
+
+Element-wise arithmetic on IntTuples. These emit corresponding `fly.int_tuple_*` ops and are useful for manipulating shapes and strides directly.
+
+```python
+sum_it  = fx.int_tuple_add(a, b)
+diff_it = fx.int_tuple_sub(a, b)
+prod_it = fx.int_tuple_mul(a, b)
+quot_it = fx.int_tuple_div(a, b)
+mod_it  = fx.int_tuple_mod(a, b)
+
+# Reduce: product of all elements
+total   = fx.int_tuple_product(shape)
+
+# Per-mode product (for nested tuples: flatten one level)
+per_mode = fx.int_tuple_product_each(shape)
+```
+
+---
+
+## Full Example: Layout Construction and Coordinate Mapping
+
+```python
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+@flyc.kernel
+def layout_demo(A: fx.Tensor):
+    tid = fx.thread_idx.x
+
+    # Build an 8×16 column-major layout
+    shape  = fx.make_shape(8, 16)
+    stride = fx.make_stride(1, 8)
+    layout = fx.make_layout(shape, stride)
+
+    # Map the thread ID back to a 2D coordinate
+    coord = fx.idx2crd(tid, layout)         # (tid % 8, tid // 8)
+    row   = fx.get(coord, 0)
+    col   = fx.get(coord, 1)
+
+    # Map a specific coordinate to an offset
+    my_coord = fx.make_coord(row, col)
+    offset   = fx.crd2idx(my_coord, layout)
+
+    # Simplify a composed layout
+    tiler    = fx.make_layout((2, 2), (1, 2))
+    composed = fx.composition(layout, tiler)
+    simple   = fx.coalesce(composed)
+```
+
+The corresponding MLIR fragment for the coordinate mapping section:
+
+```mlir
+%shape  = fly.make_shape()   : !fly.int_tuple<(8, 16)>
+%stride = fly.make_stride()  : !fly.int_tuple<(1, 8)>
+%layout = fly.make_layout(%shape, %stride)
+    : (!fly.int_tuple<(8, 16)>, !fly.int_tuple<(1, 8)>) -> !fly.layout<(8, 16):(1, 8)>
+
+%tid_it = fly.make_int_tuple(%tid : i32) : !fly.int_tuple<?>
+%coord  = fly.idx2crd(%tid_it, %layout)
+    : (!fly.int_tuple<?>, !fly.layout<(8, 16):(1, 8)>) -> !fly.int_tuple<(?, ?)>
+```
+
+---
+
+## Source File Reference
+
+| File | Description |
+|---|---|
+| `include/flydsl/Dialect/Fly/IR/FlyOps.td` | Op definitions for all layout, structural, product, divide, and atom ops |
+| `include/flydsl/Dialect/Fly/Utils/LayoutUtils.h` | C++ layout algebra algorithms (composition, product, divide) |
+| `python/flydsl/expr/primitive.py` | All `fx.*` layout functions — construction, query, algebra, products, divides |
+| `python/flydsl/expr/derived.py` | `ThrCopy`, `ThrMma`, `make_layout_tv`, `make_tiled_copy_{A,B,C}` |
+| `tests/mlir/LayoutAlgebra/` | MLIR lit tests for layout algebra operations |

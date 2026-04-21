@@ -1,0 +1,236 @@
+---
+title: "Installing FlyDSL from Source on AMD ROCm Linux"
+description: "Step-by-step guide to building LLVM/MLIR and FlyDSL from source on AMD ROCm Linux, covering prerequisites, build scripts, and common troubleshooting steps."
+keywords: ["FlyDSL install", "build from source", "LLVM MLIR build", "ROCm setup", "nanobind", "cmake"]
+---
+
+FlyDSL is built from source and requires a compatible LLVM/MLIR build with Python bindings enabled. The process takes two main build steps plus a `pip install`. This guide walks through each step in order.
+
+<Note>
+FlyDSL currently targets Linux with ROCm 6.x or 7.x. Windows and macOS are not supported.
+</Note>
+
+## Prerequisites
+
+Before building, make sure the following are available in your environment:
+
+| Requirement | Version | Notes |
+|---|---|---|
+| **ROCm** | 6.x or 7.x | Required for GPU execution |
+| **cmake** | ≥ 3.20 | Used by both build scripts |
+| **C++ compiler** | C++17 | GCC or Clang |
+| **Ninja** | any | Optional but recommended — falls back to `make` |
+| **Python** | ≥ 3.10 | Must match the Python used at build time |
+| **nanobind** | ≥ 2.0 | Python binding generator — installed by `build_llvm.sh` |
+| **numpy** | any | Installed by `build_llvm.sh` |
+| **pybind11** | ≥ 2.10 | Installed by `build_llvm.sh` |
+
+Clone the FlyDSL repository before proceeding:
+
+```bash
+git clone https://github.com/ROCm/FlyDSL.git
+cd FlyDSL
+```
+
+## Build steps
+
+<Steps>
+  <Step title="Build LLVM/MLIR">
+    FlyDSL requires LLVM/MLIR with Python bindings enabled. The `build_llvm.sh` script clones the pinned LLVM commit (from `thirdparty/llvm-hash.txt`), installs Python dependencies, and builds MLIR with AMDGPU and Python binding support.
+
+    ```bash
+    bash scripts/build_llvm.sh -j64
+    ```
+
+    This builds LLVM into `../llvm-project/build-flydsl/` relative to your FlyDSL clone, then installs a clean prefix to `../llvm-project/mlir_install/` and creates a tarball at `../llvm-project/mlir_install.tgz`.
+
+    The build takes approximately 30 minutes with `-j64`. Adjust the job count to match your machine.
+
+    <Tip>
+    If you already have an MLIR build with Python bindings enabled, skip this step and set `MLIR_PATH` instead:
+
+    ```bash
+    export MLIR_PATH=/path/to/your/mlir_install
+    ```
+    </Tip>
+
+    The CMake flags used by `build_llvm.sh` enable the AMDGPU target, MLIR Python bindings via nanobind, and the ROCM runner:
+
+    ```
+    -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU"
+    -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+    -DMLIR_ENABLE_ROCM_RUNNER=ON
+    -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=mlir
+    ```
+  </Step>
+
+  <Step title="Build FlyDSL">
+    With MLIR available, build the Fly dialect, C++ Python bindings, and staged Python package:
+
+    ```bash
+    bash scripts/build.sh -j64
+    ```
+
+    The script auto-detects `MLIR_PATH` by checking these locations in order:
+
+    ```
+    ../llvm-project-flydsl/build-flydsl/mlir_install
+    ../llvm-project/build-flydsl/mlir_install
+    ../llvm-project/mlir_install
+    ```
+
+    To use a different path, set `MLIR_PATH` before running:
+
+    ```bash
+    MLIR_PATH=/path/to/mlir_install bash scripts/build.sh -j64
+    ```
+
+    After a successful build, the complete Python package with embedded MLIR bindings is at:
+
+    ```
+    build-fly/python_packages/flydsl/
+    ```
+
+    To rebuild after C++ changes only (no LLVM rebuild needed):
+
+    ```bash
+    bash scripts/build.sh -j64
+    ```
+
+    Python-only changes require no rebuild when using the editable install in step 3.
+  </Step>
+
+  <Step title="Install in development mode">
+    Install FlyDSL as an editable package so that changes to `python/flydsl/` are immediately reflected without rebuilding:
+
+    ```bash
+    pip install -e .
+    ```
+
+    This creates a symlink at `python/flydsl/_mlir` pointing to the built `_mlir` package in `build-fly/python_packages/flydsl/_mlir`, making the embedded MLIR bindings importable.
+
+    Verify the install:
+
+    ```bash
+    python -c "import flydsl; print(flydsl.__version__)"
+    ```
+  </Step>
+
+  <Step title="Run the tests">
+    Confirm everything works by running the GEMM correctness tests:
+
+    ```bash
+    bash scripts/run_tests.sh
+    ```
+
+    The test suite completes in approximately 15 seconds. For performance benchmarks:
+
+    ```bash
+    bash scripts/run_benchmark.sh
+    ```
+  </Step>
+</Steps>
+
+## Alternative: set paths manually
+
+If you prefer not to use `pip install -e .`, set the Python and library paths directly:
+
+```bash
+export PYTHONPATH=$(pwd)/build-fly/python_packages:$(pwd):$PYTHONPATH
+export LD_LIBRARY_PATH=$(pwd)/build-fly/python_packages/flydsl/_mlir/_mlir_libs:$LD_LIBRARY_PATH
+```
+
+Add these exports to your shell profile to make them persistent.
+
+## Quick reference
+
+```bash
+# Full build from scratch (one-time):
+bash scripts/build_llvm.sh -j64   # build LLVM/MLIR (~30 min)
+bash scripts/build.sh -j64        # build FlyDSL
+pip install -e .                   # install in dev mode
+bash scripts/run_tests.sh          # verify
+
+# Rebuild after C++ changes:
+bash scripts/build.sh -j64
+
+# Python-only changes:
+# No rebuild needed — editable install reflects changes automatically.
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Wrong LLVM picked up (std::gcd not found, redeclaration errors)">
+    If you see compilation errors like `std::gcd not found` or redeclaration errors, `build.sh` is likely finding a different LLVM than the one built by `build_llvm.sh`.
+
+    Unset `MLIR_PATH` and let `build.sh` auto-detect:
+
+    ```bash
+    unset MLIR_PATH
+    bash scripts/build.sh -j64
+    ```
+
+    Or point it explicitly to the correct install:
+
+    ```bash
+    export MLIR_PATH=/path/to/llvm-project/mlir_install
+    bash scripts/build.sh -j64
+    ```
+  </Accordion>
+
+  <Accordion title="No module named flydsl">
+    The package is not on `PYTHONPATH`. Either run the editable install:
+
+    ```bash
+    pip install -e .
+    ```
+
+    Or set `PYTHONPATH` manually:
+
+    ```bash
+    export PYTHONPATH=$(pwd)/build-fly/python_packages:$(pwd):$PYTHONPATH
+    ```
+  </Accordion>
+
+  <Accordion title="MLIR .so load errors (shared library not found)">
+    The MLIR runtime shared libraries are not on the dynamic linker path. Add them:
+
+    ```bash
+    export LD_LIBRARY_PATH=$(pwd)/build-fly/python_packages/flydsl/_mlir/_mlir_libs:$LD_LIBRARY_PATH
+    ```
+
+    If you used a custom `MLIR_PATH`, also add its `lib/` directory:
+
+    ```bash
+    export LD_LIBRARY_PATH=$MLIR_PATH/lib:$LD_LIBRARY_PATH
+    ```
+  </Accordion>
+
+  <Accordion title="Stale kernel cache after code changes">
+    The JIT disk cache at `~/.flydsl/cache/` auto-invalidates when the kernel source or closures change. However, changes to C++ passes or non-closure helpers may not be detected.
+
+    Clear the cache manually:
+
+    ```bash
+    rm -rf ~/.flydsl/cache
+    ```
+
+    Or disable caching entirely for a session:
+
+    ```bash
+    export FLYDSL_RUNTIME_ENABLE_CACHE=0
+    ```
+  </Accordion>
+
+  <Accordion title="pip install -e . triggers an unexpected rebuild">
+    `setup.py` automatically invokes `scripts/build.sh` if the embedded `_mlir` package is missing. To suppress this behavior, set:
+
+    ```bash
+    export FLY_REBUILD=0
+    pip install -e .
+    ```
+
+    Use `FLY_REBUILD=1` to force a rebuild, or `FLY_REBUILD=auto` (the default) to build only when the artifact is missing.
+  </Accordion>
+</AccordionGroup>

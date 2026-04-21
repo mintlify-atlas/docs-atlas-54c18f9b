@@ -1,97 +1,83 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "FlyDSL: High-Performance GPU Kernel DSL for AMD ROCm"
+description: "FlyDSL is a Python DSL and MLIR compiler stack for authoring GPU kernels with explicit layout algebra, tiling, and JIT compilation targeting AMD GPUs."
 ---
 
-## Setting up
+FlyDSL lets you write high-performance GPU kernels in Python using a layout algebra inspired by CuTe/CUTLASS, then compiles them end-to-end through MLIR to AMD GPU binaries. You get explicit control over tiling hierarchies, data movement, and instruction scheduling — without leaving Python.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Build LLVM/MLIR, compile FlyDSL, and install in development mode.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write and launch your first GPU kernel with layout algebra in minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Layout System" icon="table-cells" href="/concepts/layout-system">
+    Understand shapes, strides, layouts, and the algebra that powers FlyDSL.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/expr">
+    Explore the full Python expression API, compiler decorators, and runtime.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What is FlyDSL?
 
-Everything you need to create world-class documentation.
+FlyDSL is the Python front-end of the **Fly** project — a Flexible Layout Python DSL for AMD ROCm GPUs. It exposes:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+- **`@flyc.kernel`** — defines a GPU kernel function traced to MLIR
+- **`@flyc.jit`** — JIT-compiles and launches the host-side driver
+- **`flydsl.expr` (`fx`)** — layout algebra, copy atoms, MMA atoms, arithmetic, and GPU intrinsics
+- **Pre-built kernels** — production-ready GEMM, normalization, attention, and MoE kernels
 
-## Need inspiration?
+The compiler lowers Python-traced MLIR through the Fly dialect to ROCDL and binary fatbin artifacts, with automatic disk caching for fast subsequent launches.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Supported hardware
+
+<CardGroup cols={2}>
+  <Card title="CDNA3 (MI300X/MI308X)" icon="microchip" href="/concepts/architecture">
+    gfx942 — MFMA, BufferCopy, preshuffle GEMM
+  </Card>
+  <Card title="CDNA4 (MI350/MI355X)" icon="microchip" href="/concepts/architecture">
+    gfx950 — MFMA_SCALE, FP4, 160KB LDS
+  </Card>
+  <Card title="RDNA4 (Radeon AI PRO R9700)" icon="microchip" href="/concepts/architecture">
+    gfx1201 — WMMA, RDNA-specific GEMM
+  </Card>
+  <Card title="gfx1250 (MI450)" icon="microchip" href="/concepts/architecture">
+    TDM ops, FP8/FP4 GEMM, multi-stage pipeline
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Build LLVM/MLIR">
+    Run `bash scripts/build_llvm.sh -j64` to compile LLVM and MLIR from source (one-time, ~30 min).
+  </Step>
+  <Step title="Build FlyDSL">
+    Run `bash scripts/build.sh -j64` to compile the Fly dialect and Python bindings.
+  </Step>
+  <Step title="Install in dev mode">
+    Run `pip install -e .` for an editable install that reflects Python source changes immediately.
+  </Step>
+  <Step title="Run your first kernel">
+    Follow the [Quickstart](/quickstart) to write a vector addition kernel with layout algebra.
+  </Step>
+</Steps>
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Architecture guide" icon="sitemap" href="/concepts/architecture">
+    Understand the compilation pipeline from Python to GPU binary.
+  </Card>
+  <Card title="Kernel authoring guide" icon="pen-to-square" href="/guides/kernel-authoring">
+    Write kernels with tiled copy, MFMA atoms, and shared memory.
+  </Card>
+  <Card title="Pre-built kernels" icon="box-archive" href="/kernels/overview">
+    Use production GEMM, LayerNorm, Softmax, and attention kernels directly.
+  </Card>
+  <Card title="Autotuning" icon="sliders" href="/guides/autotuning">
+    Search tile configurations automatically with the @autotune decorator.
+  </Card>
+</CardGroup>

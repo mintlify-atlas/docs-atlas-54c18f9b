@@ -1,0 +1,98 @@
+---
+title: "Introduction to FlyDSL: Python DSL for AMD GPU Kernels"
+description: "FlyDSL is a Python DSL and MLIR compiler stack for writing high-performance AMD ROCm GPU kernels with explicit layout algebra, tiling, and JIT compilation."
+keywords: ["FlyDSL", "AMD ROCm", "GPU kernels", "MLIR", "layout algebra", "Python DSL", "CDNA", "RDNA"]
+---
+
+FlyDSL (**F**lexible **l**ayout p**y**thon DSL) is an open-source Python front-end for authoring high-performance GPU kernels on AMD ROCm hardware. You write kernels in Python using a layout algebra inspired by CuTe/CUTLASS, and FlyDSL compiles them end-to-end through MLIR to native AMD GPU binaries — with no external MLIR Python wheel required.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Build LLVM/MLIR and FlyDSL from source, then install in development mode.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write and launch a vector addition kernel with layout algebra in minutes.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the compilation pipeline from Python tracing to GPU fatbin.
+  </Card>
+  <Card title="Layout system" icon="table-cells" href="/concepts/layout-system">
+    Learn about shapes, strides, layout algebra, and coordinate mapping.
+  </Card>
+  <Card title="Kernel authoring guide" icon="pen-to-square" href="/guides/kernel-authoring">
+    Write kernels with tiled copy, MFMA atoms, and shared memory allocation.
+  </Card>
+  <Card title="Pre-built kernels" icon="box-archive" href="/kernels/overview">
+    Use production-ready GEMM, normalization, attention, and MoE kernels.
+  </Card>
+</CardGroup>
+
+## What is FlyDSL?
+
+FlyDSL is the Python front-end of the **Fly** project — a compiler stack built on MLIR that targets AMD GPUs. Its core is the `fly` dialect: a first-class layout IR with explicit algebra, coordinate mapping, and a composable lowering pipeline down to GPU/ROCDL.
+
+The project has three main layers:
+
+- **FlyDSL (Python DSL)** — author kernels in Python using `@flyc.kernel` and `@flyc.jit` decorators, then compile them through the Fly dialect. The primary package lives in `python/flydsl/`.
+- **Fly dialect** — the layout IR and compiler foundation. Core abstractions include `!fly.int_tuple`, `!fly.layout`, `!fly.coord_tensor`, and `!fly.memref`, with algebra ops for composition, product, divide, and partition.
+- **Embedded MLIR Python runtime** (`_mlir`) — MLIR Python bindings are built and staged into `build-fly/python_packages/flydsl/_mlir`. No external `mlir` Python wheel is needed.
+
+## Key features
+
+**Explicit layout algebra** — FlyDSL exposes the full CuTe-style layout algebra in Python: `make_layout`, `logical_divide`, `raked_product`, `composition`, and more. You control tiling hierarchies across block, warp, thread, and instruction scopes.
+
+**`@flyc.kernel` and `@flyc.jit` decorators** — `@flyc.kernel` defines a GPU kernel that is traced to an MLIR module. `@flyc.jit` defines the host-side launch function that JIT-compiles and dispatches the kernel with a given grid and block configuration.
+
+**`flydsl.expr` (`fx`) module** — the expression API provides layout ops, copy atoms (`UniversalCopy32b`, `BufferCopy32b`), MMA atoms (MFMA, WMMA), arithmetic ops, GPU intrinsics (`fx.thread_idx.x`, `fx.block_idx.x`), and memory operations.
+
+**End-to-end MLIR lowering** — the compiler traces Python to `gpu`, `arith`, `scf`, and `memref` MLIR dialects, then lowers through `fly-canonicalize` → `fly-layout-lowering` → `convert-fly-to-rocdl` → `gpu-module-to-binary` to produce a cached fatbin artifact.
+
+**Automatic disk caching** — compiled kernels are cached to `~/.flydsl/cache/` and reused on subsequent calls with the same type signature. The cache auto-invalidates on source or closure changes.
+
+**CUDA Graph support** — the `fly-gpu-stream-inject` pass enables CUDA Graph capture without TLS hacks, making kernels compatible with PyTorch graph capture workflows.
+
+**Autotuning** — the `@autotune` decorator supports Triton-style tile configuration search over compile-time `Constexpr` parameters.
+
+**Pre-built production kernels** — the `kernels/` package provides importable, performance-tuned kernels for GEMM (preshuffle, blockscale, split-K, MoE), normalization (LayerNorm, RMSNorm), Softmax, fused RoPE, paged attention, flash attention, and all-reduce.
+
+## Supported hardware
+
+FlyDSL is tested on Linux with ROCm 6.x and 7.x across four GPU architectures:
+
+| Architecture | Chip | Models | Wave size | Key features |
+|---|---|---|---|---|
+| **CDNA3** | gfx942 | MI300X, MI308X | 64 | MFMA, BufferCopy, preshuffle GEMM |
+| **CDNA4** | gfx950 | MI350, MI355X | 64 | MFMA_SCALE, FP4, 160 KB LDS |
+| **RDNA4** | gfx1201 | Radeon AI PRO R9700 | 32 | WMMA, RDNA-specific GEMM |
+| **gfx1250** | gfx1250 | MI450 | 32 | TDM ops, FP8/FP4 GEMM, multi-stage pipeline |
+
+<Note>
+FlyDSL is an experimental tool and is not part of the official ROCm distribution. It is provided for evaluation and testing purposes. For inquiries, open a discussion on the [GitHub repository](https://github.com/ROCm/FlyDSL).
+</Note>
+
+## Compilation pipeline
+
+On the first call to a `@flyc.jit` function, FlyDSL traces the Python function into an MLIR module, then runs it through the `MlirCompiler` pass pipeline:
+
+```
+Python function (@flyc.kernel / @flyc.jit)
+        │
+        ▼  AST rewriting + tracing
+   MLIR module (gpu, arith, scf, memref dialects)
+        │
+        ▼  MlirCompiler.compile()
+   gpu-kernel-outlining
+   fly-canonicalize
+   fly-layout-lowering
+   convert-fly-to-rocdl
+   canonicalize + cse
+   gpu.module (convert-gpu-to-rocdl)
+   rocdl-attach-target {chip=gfxNNN}
+   gpu-to-llvm → convert-arith/func-to-llvm
+   gpu-module-to-binary {format=fatbin}
+        │
+        ▼
+   Cached compiled artifact (ExecutionEngine)
+```
+
+The resulting artifact is cached to disk and reused for subsequent calls with matching type signatures.

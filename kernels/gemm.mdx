@@ -1,0 +1,253 @@
+---
+title: "GEMM Kernels: Preshuffle, Split-K, RDNA, and MoE GEMM"
+description: "FlyDSL GEMM kernel variants — preshuffle GEMM, HGEMM split-K, RDNA FP16, and MoE 2-stage — with builder APIs, dtype tables, and full code examples."
+---
+
+FlyDSL provides multiple GEMM (matrix multiply) kernels tuned for different precisions, GPU families, and use cases. All GEMM kernels are implemented with the `@flyc.kernel` / `@flyc.jit` API and auto-compile on first call, caching the result to `~/.flydsl/cache/`. The primary kernel for CDNA hardware is the **preshuffle GEMM**, which uses MFMA 16×16 instructions with a B-matrix preshuffle layout and optional ping-pong LDS double-buffering.
+
+## GEMM variant overview
+
+| Kernel | Builder | Dtypes | Target GPU | Key technique |
+|---|---|---|---|---|
+| Preshuffle GEMM | `compile_preshuffle_gemm_a8` | fp8, int8, int4, fp16, bf16, fp4 | gfx942, gfx950 | MFMA 16×16, preshuffle B, ping-pong LDS |
+| Blockscale GEMM | `kernels.blockscale_preshuffle_gemm` | fp8, bf16 | gfx950 | MFMA_SCALE 16×16×128 |
+| HGEMM split-K | `compile_hgemm_kernel` | f16, bf16 | gfx942, gfx950 | Split-K atomic reduction |
+| RDNA FP16 GEMM | `kernels.rdna_f16_gemm` | f16, fp8 | gfx1201 | WMMA |
+| MoE GEMM 2-stage | `kernels.moe_gemm_2stage` | fp8, f16, bf16, int8, int4 | gfx942, gfx950 | Gate+up fused, reduce |
+| MoE Blockscale | `kernels.moe_blockscale_2stage` | fp8, bf16 | gfx950 | Blockscale + MoE reduce |
+
+---
+
+## Preshuffle GEMM (`kernels/preshuffle_gemm.py`)
+
+The preshuffle GEMM computes `C[M,N] = A[M,K] @ B[N,K]^T` using MFMA 16×16 instructions. B is pre-shuffled offline into a hardware-friendly layout that avoids LDS bank conflicts and enables coalesced loads. The kernel supports eight input dtypes and two epilogue strategies.
+
+### Builder function
+
+```python
+from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+
+launch_fn = compile_preshuffle_gemm_a8(
+    M=0,                    # 0 = dynamic; set to a fixed value to specialize
+    N=5120,
+    K=8192,
+    tile_m=16,
+    tile_n=128,
+    tile_k=256,
+    in_dtype="fp8",
+    out_dtype="fp16",       # "fp16" (default) or "bf16"
+    lds_stage=2,            # 2 = ping-pong LDS (recommended), 1 = single buffer
+    use_cshuffle_epilog=False,
+)
+```
+
+The builder returns a `@flyc.jit`-decorated function. It performs shape validation immediately and defers MLIR compilation to the first call.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `M` | int | `0` | M dimension (0 = dynamic at runtime) |
+| `N` | int | required | N dimension |
+| `K` | int | required | K dimension (must be compile-time constant) |
+| `tile_m` | int | required | Block tile size along M |
+| `tile_n` | int | required | Block tile size along N |
+| `tile_k` | int | required | Block tile size along K |
+| `in_dtype` | str | `"fp8"` | Input dtype: `"fp8"`, `"int8"`, `"int4"`, `"fp16"`, `"bf16"`, `"fp4"` |
+| `out_dtype` | str | `"fp16"` | Output dtype: `"fp16"` or `"bf16"` |
+| `lds_stage` | int | `2` | `2` = ping-pong, `1` = single LDS buffer |
+| `use_cshuffle_epilog` | bool | `False` | CK-style CShuffle LDS epilogue |
+| `waves_per_eu` | int \| None | `None` | Occupancy hint (1–4); `None` = hardware default |
+| `use_async_copy` | bool | `False` | Use async DMA for A tile global→LDS transfers |
+| `epilogue` | str | `"none"` | Fused epilogue: `"none"`, `"bias"`, `"bias_relu"`, `"bias_silu"`, `"bias_gelu"` |
+
+### Launch function signature
+
+```python
+launch_fn(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, M_val, N_val, stream=None)
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `arg_c` | `torch.Tensor` | Output tensor `[M, N]` |
+| `arg_a` | `torch.Tensor` | A matrix `[M, K]` |
+| `arg_b` | `torch.Tensor` | B matrix in preshuffle layout `[N, K]` |
+| `arg_scale_a` | `torch.Tensor` | Per-token (row) scales for A (fp8/int8) |
+| `arg_scale_b` | `torch.Tensor` | Per-channel (col) scales for B (fp8/int8) |
+| `M_val` | int | Runtime M dimension |
+| `N_val` | int | Runtime N dimension |
+| `stream` | `fx.Stream` \| None | Optional ROCm stream |
+
+<Note>
+  For `in_dtype="fp16"` or `"bf16"`, `arg_scale_a` and `arg_scale_b` are ignored — pass any tensor of the right device.
+</Note>
+
+### Full code example
+
+```python
+import torch
+from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+
+M, N, K = 64, 5120, 8192
+
+# Compile once for this (N, K, tile, dtype) configuration
+launch_fn = compile_preshuffle_gemm_a8(
+    M=0, N=N, K=K,
+    tile_m=64, tile_n=128, tile_k=256,
+    in_dtype="fp8",
+    lds_stage=2,
+)
+
+# Allocate tensors
+a       = torch.zeros(M, K,   dtype=torch.float8_e4m3fnuz, device="cuda")
+b       = torch.zeros(N, K,   dtype=torch.float8_e4m3fnuz, device="cuda")  # pre-shuffled
+c       = torch.zeros(M, N,   dtype=torch.float16, device="cuda")
+scale_a = torch.ones(M,       dtype=torch.float32, device="cuda")
+scale_b = torch.ones(N,       dtype=torch.float32, device="cuda")
+
+# First call triggers JIT compilation; subsequent calls are fast
+launch_fn(c, a, b, scale_a, scale_b, M, N)
+torch.cuda.synchronize()
+```
+
+### Supported dtype table
+
+| `in_dtype` | A storage | B storage | Accumulator | Notes |
+|---|---|---|---|---|
+| `fp8` | float8_e4m3fnuz | float8_e4m3fnuz | f32 | Per-token A scale, per-channel B scale |
+| `int8` | int8 | int8 | i32→f32 | MFMA i32_16×16×32i8 |
+| `int4` | int8 (A) | packed int4 (B) | i32→f32 | W4A8: 2 int4 packed/byte, unpacked in-kernel |
+| `fp16` | float16 | float16 | f32 | No scaling required |
+| `bf16` | bfloat16 | bfloat16 | f32 | No scaling required |
+| `fp4` | int8 (packed) | int8 (packed) | f32 | MFMA_SCALE 16×16×128; gfx950 only |
+
+<Warning>
+  `tile_k * elem_bytes` must be divisible by 64. For example, with `in_dtype="fp8"` (1 byte/elem), `tile_k` must be a multiple of 64. With `in_dtype="fp16"` (2 bytes/elem), `tile_k` must be a multiple of 32.
+</Warning>
+
+### Pipeline details
+
+The preshuffle GEMM supports two LDS pipeline modes:
+
+**`lds_stage=2` (ping-pong, recommended)**: Two separate LDS buffers (`smem0` / `smem1`) for A tiles. The prefetch scheduler overlaps global memory reads for the next A tile with MFMA instructions for the current tile. Uses XOR16 swizzle on LDS addresses to eliminate bank conflicts.
+
+**`lds_stage=1` (single buffer)**: CK-style intrawave schedule with a single LDS buffer. Lower LDS pressure but less latency hiding.
+
+**B-preshuffle layout** stores B in shape `(N/16, K/64, 4, 16, kpack_bytes)` — interleaving threads' required data to allow coalesced buffer loads. Prepare with `hgemm_shuffle_b()` (see `hgemm_splitk.py`) or equivalent offline pre-processing.
+
+---
+
+## HGEMM split-K (`kernels/hgemm_splitk.py`)
+
+The `compile_hgemm_kernel` builder generates FP16 or BF16 GEMM kernels with optional split-K reduction. Split-K partitions the K dimension across multiple thread blocks and accumulates partial results via atomic add — useful for skinny (small-M) matrix multiplications.
+
+### Builder function
+
+```python
+from kernels.hgemm_splitk import compile_hgemm_kernel
+
+launch_fn = compile_hgemm_kernel(
+    dtype="f16",   # "f16" or "bf16"
+    n=5120,
+    k=8192,
+    TILE_M=128,
+    TILE_N=128,
+    TILE_K=64,
+    SPLIT_K=1,     # > 1 enables split-K reduction
+    BLOCK_M_WARPS=1,
+    BLOCK_N_WARPS=4,
+    B_PRE_SHUFFLE=True,
+    B_TO_LDS=False,
+)
+```
+
+### Key parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `SPLIT_K` | `1` | Number of K-axis partitions (1 = no split) |
+| `B_PRE_SHUFFLE` | `False` | Use pre-shuffled B for better B load bandwidth |
+| `B_TO_LDS` | `False` | Stage B through LDS (mutually exclusive with `B_PRE_SHUFFLE`) |
+| `TILE_M`, `TILE_N`, `TILE_K` | `128`, `128`, `64` | Block tile dimensions |
+| `BLOCK_M_WARPS`, `BLOCK_N_WARPS` | `1`, `4` | Warp grid within a thread block |
+
+### Default tile selection heuristics
+
+`hgemm_splitk_` (the high-level entry point) calls `get_default_kwargs(m, n, k)` to pick sensible defaults:
+
+```python
+from kernels.hgemm_splitk import hgemm_splitk_
+
+c = torch.zeros(m, n, dtype=torch.float16, device="cuda")
+a = torch.randn(m, k, dtype=torch.float16, device="cuda")
+b = torch.randn(n, k, dtype=torch.float16, device="cuda")
+
+hgemm_splitk_(c, a, b, shuffle_b=True)
+```
+
+For small-M workloads (M ≤ 32), the defaults automatically raise `SPLIT_K` to 4 or 8 to improve GPU occupancy.
+
+### GPU-specific MFMA selection
+
+| GPU arch | WMMA instruction | `DMA_BYTES` | Async copy |
+|---|---|---|---|
+| gfx942 (MI300X) | `mfma_f32_16x16x16f16` / `bf16_1k` | 4 B | No |
+| gfx950+ (MI350) | `mfma_f32_16x16x32f16` / `bf16` | 16 B | Yes |
+
+---
+
+## RDNA FP16 GEMM (`kernels/rdna_f16_gemm.py`)
+
+`kernels.rdna_f16_gemm` targets RDNA4 GPUs (gfx1201 — Radeon AI PRO R9700) using WMMA instructions rather than MFMA. Import and use patterns follow the same builder convention.
+
+```python
+from kernels.rdna_f16_gemm import build_rdna_f16_gemm  # check module for exact name
+```
+
+<Note>
+  Run the RDNA GEMM test suite to verify correctness on your hardware: `PYTHONPATH=./ pytest tests/kernels/test_rdna_gemm.py`
+</Note>
+
+---
+
+## MoE GEMM 2-stage (`kernels/moe_gemm_2stage.py`)
+
+The MoE GEMM kernel implements the fused gate-and-up projection plus expert-reduce step used in Mixture of Experts (MoE) transformer layers. A 2-stage pipeline first computes the expert projections, then performs the weighted reduction.
+
+```python
+from kernels.moe_gemm_2stage import build_moe_gemm  # check module for exact builder name
+```
+
+**Blockscale variant**: `kernels/moe_blockscale_2stage.py` provides a MFMA_SCALE-based MoE kernel targeting gfx950, using block-level FP8 scaling for higher throughput.
+
+### Supported dtypes
+
+| Variant | Supported dtypes | GPU |
+|---|---|---|
+| `moe_gemm_2stage` | fp8, f16, bf16, int8, int4 | gfx942, gfx950 |
+| `moe_blockscale_2stage` | fp8, bf16 | gfx950 only |
+
+---
+
+## Testing GEMM kernels
+
+```bash
+# Preshuffle GEMM — FP8, INT8, INT4, BF16, FP4
+PYTHONPATH=./ pytest tests/kernels/test_preshuffle_gemm.py
+
+# Blockscale GEMM
+PYTHONPATH=./ pytest tests/kernels/test_blockscale_preshuffle_gemm.py
+
+# HGEMM split-K
+PYTHONPATH=./ pytest tests/kernels/test_hgemm_splitk.py
+
+# MoE GEMM
+PYTHONPATH=./ pytest tests/kernels/test_moe_gemm.py
+
+# RDNA GEMM
+PYTHONPATH=./ pytest tests/kernels/test_rdna_gemm.py
+```
+
+<Tip>
+  Set `FLYDSL_DUMP_IR=1` to dump MLIR IR at each compilation stage. Set `FLYDSL_RUNTIME_ENABLE_CACHE=0` to bypass the disk cache when iterating on kernel code.
+</Tip>

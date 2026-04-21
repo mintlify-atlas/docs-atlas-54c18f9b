@@ -1,0 +1,653 @@
+---
+title: "flydsl.expr (fx) — DSL Expression & Layout API Reference"
+description: "Complete reference for the FlyDSL expression module: types, layout construction, coordinate mapping, algebra, copy/MMA atoms, memory, and GPU intrinsics."
+keywords: ["flydsl", "fx", "layout", "tensor", "copy atom", "MMA", "GPU", "MLIR"]
+---
+
+The `flydsl.expr` module — conventionally imported as `fx` — is the primary DSL surface for authoring GPU kernels. It exposes MLIR type wrappers, layout algebra, copy and MMA atoms, shared-memory helpers, and GPU intrinsics. All operations that emit MLIR IR must be called inside a `@flyc.kernel` or `@flyc.jit` function body.
+
+```python
+import flydsl.expr as fx
+from flydsl.expr import arith, vector, gpu, rocdl
+```
+
+---
+
+## Types
+
+### Scalar numeric types
+
+These classes wrap MLIR integer and floating-point types with value semantics. Each has an `ir_type` class attribute and supports arithmetic via `ArithValue`.
+
+| Class | MLIR type | Width | Notes |
+|---|---|---|---|
+| `Boolean` | `i1` | 1 | Signless boolean |
+| `Int4` | `i4` | 4 | Signed 4-bit integer |
+| `Int8` | `i8` | 8 | Signed 8-bit integer |
+| `Int16` | `i16` | 16 | Signed 16-bit integer |
+| `Int32` | `i32` | 32 | Default integer type |
+| `Int64` | `i64` | 64 | 64-bit integer |
+| `Uint8` | `ui8` | 8 | Unsigned |
+| `Uint16` | `ui16` | 16 | Unsigned |
+| `Uint32` | `ui32` | 32 | Unsigned |
+| `Uint64` | `ui64` | 64 | Unsigned |
+| `Float16` | `f16` | 16 | Half precision |
+| `BFloat16` | `bf16` | 16 | Brain float |
+| `Float32` | `f32` | 32 | Single precision |
+| `Float64` | `f64` | 64 | Double precision |
+| `Float8E4M3FN` | `f8E4M3FN` | 8 | OCP FP8, gfx95x/gfx12xx |
+| `Float8E4M3FNUZ` | `f8E4M3FNUZ` | 8 | FP8, gfx94x (MI300) |
+| `Float8E5M2` | `f8E5M2` | 8 | FP8 E5M2 |
+| `Float4E2M1FN` | `f4E2M1FN` | 4 | FP4 |
+| `Float6E2M3FN` | `f6E2M3FN` | 6 | FP6 |
+| `Float6E3M2FN` | `f6E3M2FN` | 6 | FP6 variant |
+| `Index` | `index` | — | MLIR index type |
+
+### `T` — MLIR type constructor object
+
+`T` is a singleton `Types` instance with property and method accessors for MLIR types. Use it wherever a raw `ir.Type` is required.
+
+```python
+from flydsl.expr.typing import T
+
+T.f16          # ir.F16Type
+T.bf16         # ir.BFloat16Type
+T.f32          # ir.F32Type
+T.i32          # ir.IntegerType (32-bit)
+T.i8x4         # vector<4xi8>
+T.f16x8        # vector<8xf16>
+T.f8           # arch-dependent FP8 (E4M3FN on gfx95x, E4M3FNUZ on gfx94x)
+T.vec(8, T.f16)  # vector<8xf16> — dynamic constructor
+```
+
+Vector shortcut properties follow the pattern `<scalar>x<N>`. Available variants:
+
+| Scalar | Vector variants |
+|---|---|
+| `i8` | `i8x2`, `i8x4`, `i8x8`, `i8x16` |
+| `i16` | `i16x2`, `i16x4`, `i16x8` |
+| `i32` | `i32x2`, `i32x4` |
+| `i64` | `i64x2` |
+| `f16` | `f16x2`, `f16x4`, `f16x8` |
+| `bf16` | `bf16x2`, `bf16x4`, `bf16x8` |
+| `f32` | `f32x2`, `f32x4` |
+| `f8` | `f8x2`, `f8x4`, `f8x8`, `f8x16` |
+
+### `Constexpr[T]`
+
+Generic marker for compile-time constants in function signatures. Constexpr parameters are baked into the kernel at trace time and excluded from the runtime call signature.
+
+```python
+def my_kernel(n: fx.Constexpr[int], a: fx.Tensor):
+    ...
+```
+
+### `Tensor`
+
+Runtime DSL type wrapping a `!fly.memref` MLIR value. Supports element access, vector load/store, and fill.
+
+| Property / method | Description |
+|---|---|
+| `.dtype` | Element type (`Numeric` subclass) |
+| `.address_space` | `AddressSpace` enum value |
+| `.alignment` | Byte alignment |
+| `.layout` | `Layout` describing shape and stride |
+| `.shape` | `IntTuple` of dimensions |
+| `.stride` | `IntTuple` of strides |
+| `.leading_dim` | Leading dimension hint |
+| `[coord]` | Element load or slice |
+| `[coord] = value` | Element store |
+| `.load()` | Bulk vector load → `Vector` |
+| `.store(vector)` | Bulk vector store |
+| `.fill(value)` | Fill with scalar constant |
+
+### `Stream`
+
+Opaque async queue handle. `None` selects the default HIP stream; an `int` is treated as a raw pointer.
+
+```python
+stream = fx.Stream(None)    # default stream
+stream = fx.Stream(ptr_int) # raw HIP stream pointer
+```
+
+### Layout types
+
+| Type | Description |
+|---|---|
+| `IntTuple` | Nested integer tuple (`!fly.int_tuple`) |
+| `Layout` | `(shape, stride)` pair (`!fly.layout`) |
+| `ComposedLayout` | Composed layout with inner/outer/offset |
+| `Swizzle` | Swizzle descriptor (`!fly.swizzle`) |
+| `CopyAtom` | Copy atom with thread/value layout |
+| `MmaAtom` | MMA atom with thread/value layout |
+| `TiledCopy` | Tiled copy object; use `.get_slice(tid)` |
+| `TiledMma` | Tiled MMA object; use `.get_slice(tid)` |
+| `Tile` | Opaque tile type |
+
+### `AddressSpace`
+
+```python
+fx.AddressSpace.Register   # VGPR (thread-local)
+fx.AddressSpace.Shared     # LDS / workgroup shared memory
+fx.AddressSpace.Global     # HBM / global memory
+fx.AddressSpace.BufferDesc # AMD buffer-descriptor space
+```
+
+### `Vector`
+
+Register-file vector with value semantics. Wraps a flat `vector<NxTy>` MLIR value.
+
+```python
+v = fx.full((8,), 0.0, fx.Float32)         # filled vector
+v = fx.zeros_like(template)                # zero vector matching template
+v = fx.full_like(template, 1.0)            # broadcast 1.0
+v.dtype                                    # element type
+v.shape                                    # tuple of dims, e.g. (8,)
+v.numel                                    # total element count
+v.to(fx.Float16)                           # cast to different dtype
+v.reduce("add")                            # scalar reduction
+v.bitcast(fx.Int32)                        # bitcast to new element type
+v[3]                                       # extract element at index 3
+```
+
+### `ReductionOp`
+
+Enum for vector reductions: `ADD`, `MUL`, `MAX`, `MIN`.
+
+---
+
+## Construction functions
+
+All construction functions emit MLIR ops and must run in a tracing context.
+
+### `make_shape(*dims) → IntTuple`
+
+Creates a shape tuple. Static Python integers are encoded in the type; dynamic `ir.Value` operands become SSA values.
+
+```python
+s = fx.make_shape(8, 16)          # static (8, 16)
+s = fx.make_shape(M, 16)          # dynamic first dim
+```
+
+### `make_stride(*strides) → IntTuple`
+
+Creates a stride tuple.
+
+```python
+st = fx.make_stride(1, 8)         # column-major stride for 8-row layout
+```
+
+### `make_layout(shape, stride) → Layout`
+
+Creates a layout from shape and stride. Accepts either `IntTuple` values or raw Python tuples.
+
+```python
+ly = fx.make_layout((8, 16), (1, 8))
+```
+
+### `make_coord(*elems) → IntTuple`
+
+Creates a coordinate tuple for use in `crd2idx`.
+
+```python
+c = fx.make_coord(tid_x, tid_y)
+```
+
+### `make_int_tuple(elems) → IntTuple`
+
+Creates a generic integer tuple from a Python int, list, or tuple.
+
+```python
+it = fx.make_int_tuple((4, 8, 2))
+```
+
+### `make_ordered_layout(shape, order) → Layout`
+
+Creates a layout with strides derived from the given mode ordering.
+
+<ParamField path="shape" type="IntTuple | tuple">
+  Shape of the layout.
+</ParamField>
+
+<ParamField path="order" type="IntTuple | tuple">
+  Permutation specifying stride order. `(0, 1)` = column-major, `(1, 0)` = row-major.
+</ParamField>
+
+```python
+col = fx.make_ordered_layout((M, N), order=(0, 1))
+row = fx.make_ordered_layout((M, N), order=(1, 0))
+```
+
+### `make_identity_layout(shape) → Layout`
+
+Creates a compact, column-major identity layout.
+
+---
+
+## Coordinate mapping
+
+### `crd2idx(crd, layout) → Int32`
+
+Maps a logical coordinate to a linear memory index using the layout's strides.
+
+```python
+idx = fx.crd2idx((tid_x, tid_y), layout)
+```
+
+### `idx2crd(index, layout) → IntTuple`
+
+Inverts `crd2idx`: recovers the hierarchical coordinate from a linear index.
+
+```python
+coord = fx.idx2crd(linear_idx, layout)
+```
+
+---
+
+## Query operations
+
+| Function | Returns | Description |
+|---|---|---|
+| `size(x)` | `Int32` | Product of all dimensions |
+| `cosize(layout)` | `Int32` | Codomain size (max index + 1) |
+| `get_shape(layout)` | `IntTuple` | Extract shape |
+| `get_stride(layout)` | `IntTuple` | Extract stride |
+| `get(it, mode)` | `index` | Extract element at mode index |
+| `rank(x)` | `int` | Number of top-level modes (Python int, constexpr) |
+| `depth(x)` | `int` | Nesting depth (Python int, constexpr) |
+| `get_layout(memref)` | `Layout` | Layout associated with a memref |
+
+---
+
+## Algebra
+
+### `composition(layout, tiler) → Layout`
+
+Composes two layouts: `result(x) = layout(tiler(x))`.
+
+```python
+composed = fx.composition(layout_a, layout_b)
+```
+
+### `complement(layout, codomain_size=None) → Layout`
+
+Computes the complementary layout — modes not covered by `layout` up to `codomain_size`.
+
+### `coalesce(layout, pattern=None) → Layout`
+
+Simplifies the layout by merging adjacent compatible modes. Preserves total size and mapping.
+
+```python
+simplified = fx.coalesce(layout)
+```
+
+### `right_inverse(layout) → Layout`
+
+Computes the right inverse: a layout `R` such that `layout(R(x)) = x`.
+
+### `left_inverse(layout) → Layout`
+
+Computes the left inverse.
+
+### `recast_layout(layout, old_type_bits, new_type_bits) → Layout`
+
+Adjusts stride values for a type-width change (e.g., reinterpreting FP16 data as FP8).
+
+```python
+ly8 = fx.recast_layout(ly16, old_type_bits=16, new_type_bits=8)
+```
+
+---
+
+## Products
+
+All product operations take `(layout, tiler)` and return a new layout.
+
+| Function | Description |
+|---|---|
+| `logical_product(layout, tiler)` | Mode-wise concatenation; scales tiler strides by layout size |
+| `zipped_product(layout, tiler)` | Interleaves modes from layout and tiler |
+| `tiled_product(layout, tiler)` | Creates a hierarchical tiled structure |
+| `flat_product(layout, tiler)` | Produces a flattened result |
+| `raked_product(layout, tiler)` | Creates a raked (interleaved) access pattern |
+| `block_product(layout, tiler)` | Creates a blocked access pattern |
+
+```python
+tv_layout = fx.raked_product(thr_layout, val_layout)
+```
+
+---
+
+## Divides
+
+All divide operations take `(layout, divisor)`.
+
+| Function | Description |
+|---|---|
+| `logical_divide(layout, divisor)` | Basic partitioning; uses `complement` internally |
+| `zipped_divide(layout, divisor)` | Zipped division semantics |
+| `tiled_divide(layout, divisor)` | Hierarchical tiled division |
+| `flat_divide(layout, divisor)` | Flattened division |
+
+---
+
+## Structural operations
+
+| Function | Signature | Description |
+|---|---|---|
+| `select` | `select(it, indices)` | Pick modes by index list |
+| `group` | `group(it, begin, end)` | Group a range of modes into a nested tuple |
+| `append` | `append(base, elem, n=None)` | Append a mode |
+| `prepend` | `prepend(base, elem, n=None)` | Prepend a mode |
+| `slice` | `slice(src, coord)` | Slice layout or tensor at a coordinate containing `None` |
+| `take` | `take(it, begin, end)` | Take a range of modes |
+
+```python
+modes_0_2 = fx.select(int_tuple, indices=[0, 2])
+nested    = fx.group(int_tuple, begin=1, end=3)
+extended  = fx.append(shape, new_dim)
+```
+
+---
+
+## IntTuple arithmetic
+
+```python
+fx.int_tuple_add(a, b)           # element-wise add
+fx.int_tuple_sub(a, b)           # element-wise subtract
+fx.int_tuple_mul(a, b)           # element-wise multiply
+fx.int_tuple_div(a, b)           # element-wise divide
+fx.int_tuple_mod(a, b)           # element-wise modulo
+fx.int_tuple_product(it)         # reduce to total product
+fx.int_tuple_product_each(it)    # per-mode product (nested tuples)
+fx.shape_div(lhs, rhs)           # shape-aware division
+fx.ceil_div(lhs, rhs)            # ceiling division
+```
+
+---
+
+## Copy API
+
+### Copy atom types
+
+| Factory | Bit width | Description |
+|---|---|---|
+| `UniversalCopy(bits)` | custom | Generic software copy |
+| `UniversalCopy8b()` | 8 | |
+| `UniversalCopy16b()` | 16 | |
+| `UniversalCopy32b()` | 32 | |
+| `UniversalCopy64b()` | 64 | |
+| `UniversalCopy128b()` | 128 | |
+| `UniversalAtomic(op, val_type)` | — | Generic atomic copy |
+| `UniversalAtomicAdd(val_type)` | — | Atomic add |
+| `UniversalAtomicMax(val_type)` | — | Atomic max |
+| `rocdl.BufferCopy(bits)` | custom | AMD buffer descriptor copy |
+| `rocdl.BufferCopy32b()` | 32 | |
+| `rocdl.BufferCopy64b()` | 64 | |
+| `rocdl.BufferCopy128b()` | 128 | |
+
+### `make_copy_atom(copy_op_type, elem_type) → CopyAtom`
+
+Creates a copy atom from a copy-op type and element width.
+
+<ParamField path="copy_op_type" type="CopyOpUniversalCopyType | CopyOpCDNA3BufferCopyType">
+  Copy operation type from the factory functions above.
+</ParamField>
+
+<ParamField path="elem_type" type="Numeric subclass | ir.Type | int">
+  Element type (determines `val_bits`).
+</ParamField>
+
+```python
+atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16)
+atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float16)
+```
+
+### `make_tiled_copy(copy_atom, layout_tv, tile_mn) → TiledCopy`
+
+Constructs a `TiledCopy` from a copy atom, a thread-value layout, and a tile shape.
+
+```python
+tiled_copy = fx.make_tiled_copy(copy_atom, layout_tv, tile_mn)
+```
+
+### `copy_atom_call(copy_atom, src, dst, *, pred=None)`
+
+Executes a single copy atom operation from `src` to `dst`. Optionally gated by a predicate mask.
+
+```python
+fx.copy_atom_call(copy_atom, src_part, dst_part)
+fx.copy_atom_call(copy_atom, src_part, dst_part, pred=pred_vec)
+```
+
+### `copy(copy_atom, src, dst, *, pred=None)`
+
+High-level tiled copy execution (alias for `copy_atom_call` in tiled contexts).
+
+### `TiledCopy.get_slice(thr_idx) → ThrCopy`
+
+Returns a per-thread view. `ThrCopy` provides:
+
+- `.partition_S(src)` — partition source tensor for this thread
+- `.partition_D(dst)` — partition destination tensor for this thread
+- `.retile(t)` — retile a tensor to match the copy atom shape
+
+### Helpers for MMA-matched copies
+
+```python
+fx.make_tiled_copy_A(copy_atom, tiled_mma)  # TiledCopy matched to MMA operand A
+fx.make_tiled_copy_B(copy_atom, tiled_mma)  # TiledCopy matched to MMA operand B
+fx.make_tiled_copy_C(copy_atom, tiled_mma)  # TiledCopy matched to MMA accumulator C
+```
+
+---
+
+## MMA API
+
+### MMA atom types
+
+| Factory | Architecture | Description |
+|---|---|---|
+| `rocdl.MFMA(m, n, k, elem_type)` | gfx94x, gfx95x (CDNA3/4) | Matrix Fused Multiply-Add |
+| `rocdl.WMMA(m, n, k, elem_type)` | gfx1250 (RDNA4 / MI450) | Wave Matrix Multiply-Accumulate |
+
+```python
+mma_op = fx.rocdl.MFMA(16, 16, 16, fx.Float16)           # FP16 MFMA 16×16×16
+mma_op = fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FN, elem_type_acc=fx.Float32)
+mma_op = fx.rocdl.WMMA(16, 16, 16, fx.Float16)           # RDNA4 WMMA
+```
+
+### `make_mma_atom(mma_op_type) → MmaAtom`
+
+Creates an MMA atom from an MFMA or WMMA type.
+
+```python
+mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.Float32))
+```
+
+### `make_tiled_mma(mma_atom, atom_layout, permutation=None) → TiledMma`
+
+Constructs a `TiledMma` by replicating the atom across threads.
+
+```python
+tiled_mma = fx.make_tiled_mma(mma_atom, atom_layout)
+```
+
+### `mma_atom_call(mma_atom, d, a, b, c)`
+
+Executes a single MMA instruction: `d = a * b + c`.
+
+### `gemm(mma_atom, d, a, b, c, *, traversal_order=None)`
+
+High-level GEMM: loops over the K dimension, accumulating into `d`.
+
+### `TiledMma.get_slice(thr_idx) → ThrMma`
+
+Returns a per-thread view. `ThrMma` provides:
+
+- `.partition_A(a)` — partition A operand tensor
+- `.partition_B(b)` — partition B operand tensor
+- `.partition_C(c)` — partition accumulator tensor
+- `.make_fragment_A(a)` / `.make_fragment_B(b)` / `.make_fragment_C(c)` — allocate register fragments
+
+---
+
+## Memory operations
+
+### `memref_alloca(memref_type, layout) → Tensor`
+
+Allocates a scratch buffer in shared memory (LDS) with the given type and layout.
+
+```python
+smem = fx.memref_alloca(memref_type, layout)
+```
+
+### `memref_load_vec(memref) → Vector`
+
+Loads the entire memref contents into a register vector.
+
+### `memref_store_vec(vector, memref)`
+
+Stores a register vector into a memref.
+
+### `memref_load(memref, indices)`
+
+Scalar element load at a coordinate.
+
+### `memref_store(value, memref, indices)`
+
+Scalar element store at a coordinate.
+
+---
+
+## GPU module (`fx.gpu`)
+
+The `gpu` submodule provides thread/block indexing and synchronization. All values are `Int32` by default.
+
+```python
+import flydsl.expr as fx
+
+tid_x = fx.gpu.thread_idx.x    # workitem X within workgroup
+tid_y = fx.gpu.thread_idx.y
+tid_z = fx.gpu.thread_idx.z
+
+bid_x = fx.gpu.block_idx.x     # workgroup X within grid
+bid_y = fx.gpu.block_idx.y
+bid_z = fx.gpu.block_idx.z
+
+bdim_x = fx.gpu.block_dim.x    # workgroup size X
+bdim_y = fx.gpu.block_dim.y
+bdim_z = fx.gpu.block_dim.z
+
+gdim_x = fx.gpu.grid_dim.x     # grid size X
+
+fx.gpu.barrier()               # workgroup-scope barrier (__syncthreads equivalent)
+```
+
+### Cluster operations (gfx1250 / MI450)
+
+For kernels using workgroup clustering and TDM multicast:
+
+```python
+fx.gpu.cluster_barrier()            # workgroup sync + cluster signal + wait
+fx.gpu.cluster_signal_once_per_wg() # signal cluster barrier from wave-0 only
+fx.gpu.cluster_wait()               # wait on cluster barrier
+fx.gpu.compute_cluster_position()   # returns (local_x, local_y) within cluster
+fx.gpu.compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)  # A/B MCAST masks
+fx.gpu.is_wave_leader()             # True for wave-0 inside the workgroup
+```
+
+---
+
+## Arith submodule (`fx.arith`)
+
+Thin wrappers around the MLIR `arith` dialect with DSL numeric type support.
+
+```python
+from flydsl.expr import arith
+
+c  = arith.constant(42, type=arith.T.i32)   # materialise a constant
+ci = arith.index(8)                          # index-type constant
+v  = arith.index_cast(T.index, val)          # cast to index type
+r  = arith.select(cond, a, b)               # conditional select
+r  = arith.cmpi(arith.CmpIPredicate.eq, a, b)  # integer compare → i1
+r  = arith.cmpf(arith.CmpFPredicate.olt, a, b) # float compare → i1
+r  = arith.andi(a, b)                        # bitwise AND
+r  = arith.xori(a, b)                        # bitwise XOR
+r  = arith.shli(a, b)                        # left shift
+r  = arith.sitofp(T.f32, int_val)           # int → float
+r  = arith.trunc_f(T.f16, f32_val)          # truncate float
+```
+
+`ArithValue` operands support Python operators (`+`, `-`, `*`, `/`, `%`, `//`, `==`, `<`, `>`).
+
+---
+
+## ROCDL submodule (`fx.rocdl`)
+
+Low-level AMD GPU intrinsics. Import as `from flydsl.expr import rocdl`.
+
+### Synchronization
+
+```python
+rocdl.barrier()                  # s_barrier
+rocdl.s_barrier_signal(id)       # signal named barrier
+rocdl.s_barrier_wait(id)         # wait on named barrier
+rocdl.s_waitcnt(...)             # wait count
+rocdl.s_wait_asynccnt(count=0)   # wait for async loads/stores
+```
+
+### MFMA intrinsics (gfx94x / gfx95x)
+
+```python
+rocdl.mfma_f32_16x16x16f16(result_type, [a, b, c])
+rocdl.mfma_f32_16x16x16bf16_1k(result_type, [a, b, c])
+rocdl.mfma_f32_16x16x32_fp8_fp8(result_type, [a, b, c])
+rocdl.mfma_i32_16x16x32_i8(result_type, [a, b, c])
+rocdl.mfma_scale_f32_16x16x128_f8f6f4(result_type, [a, b, c, cbsz, blgp, opselA, scaleA, opselB, scaleB])
+```
+
+### WMMA intrinsics (RDNA / gfx1250)
+
+```python
+rocdl.wmma_f32_16x16x16_f16(result_type, [a, b, c])
+rocdl.wmma_f32_16x16x16_bf16(result_type, [a, b, c])
+rocdl.wmma_f16_16x16x16_f16(result_type, [a, b, c, op_sel])
+rocdl.wmma_i32_16x16x16_iu8(result_type, [a_sign, a, b_sign, b, c, clamp])
+rocdl.wmma_scale_f32_16x16x128_f8f6f4(result_type, a, b, c, scaleA, scaleB, ...)
+rocdl.wmma_scale_f32_32x16x128_f4(result_type, a, b, c, scaleA, scaleB, ...)
+```
+
+### Buffer descriptor copy (gfx94x)
+
+```python
+rocdl.make_buffer_tensor(memref, alignment=4)  # convert global memref → buffer_desc memref
+```
+
+### Scheduling
+
+```python
+rocdl.sched_mfma(cnt)    # MFMA scheduling barrier
+rocdl.sched_vmem(cnt)    # VMEM scheduling barrier
+rocdl.sched_dsrd(cnt)    # DS read scheduling barrier
+rocdl.sched_dswr(cnt)    # DS write scheduling barrier
+rocdl.s_setprio(prio)    # set wave priority
+```
+
+<Note>
+Raw ROCDL intrinsics accept `ir.Value` operands. Use `arith.unwrap(v)` to strip DSL wrappers before passing.
+</Note>
+
+---
+
+## Debugging
+
+### `printf(format_str, *args)`
+
+Emits a GPU-side print statement using the Fly dialect `print_` op. Supports `{}` placeholders.
+
+```python
+fx.printf("tid={} val={}", tid_x, some_val)
+```
+
+Accepted argument types: `ir.Value`, `int`, `float`, `bool`, DSL types with `__fly_values__`.

@@ -1,0 +1,233 @@
+---
+title: "Kernel Autotuning with @autotune and Config in FlyDSL"
+description: "Use the @autotune decorator to benchmark GPU kernel configurations, automatically pick the fastest, and persist results to a JSON disk cache."
+---
+
+FlyDSL's autotuner wraps a `@flyc.jit` function and benchmarks a list of `Config` objects on real hardware, selecting the fastest one for each unique combination of input shapes and dtypes. Results are persisted to a JSON file so that subsequent runs skip benchmarking and dispatch immediately to the best known configuration.
+
+## The `@autotune` decorator
+
+Apply `@autotune` directly above `@flyc.jit`. The decorator replaces the `JitFunction` with an `Autotuner` instance that intercepts every call.
+
+```python
+from flydsl.autotune import autotune, Config
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+@autotune(
+    configs=[
+        Config(BLOCK=64,  num_warps=2),
+        Config(BLOCK=128, num_warps=4),
+        Config(BLOCK=256, num_warps=8, waves_per_eu=2),
+    ],
+    key=["n"],            # cache key: value of the 'n' argument
+    warmup=5,
+    rep=25,
+)
+@flyc.jit
+def vector_add(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    n: fx.Int32,
+    BLOCK: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    vector_add_kernel(A, B, C, n, BLOCK).launch(
+        grid=((n + BLOCK - 1) // BLOCK,),
+        block=(BLOCK,),
+        stream=stream,
+    )
+```
+
+On the first call for a given cache key, the autotuner runs all configs and prints timing results:
+
+```
+[autotune] tuning 3 configs...
+  [1/3] Config(BLOCK=64, num_warps=2) -> 0.042 ms
+  [2/3] Config(BLOCK=128, num_warps=4) -> 0.031 ms
+  [3/3] Config(BLOCK=256, num_warps=8, waves_per_eu=2) -> 0.028 ms
+[autotune] best: Config(BLOCK=256, num_warps=8, waves_per_eu=2) (0.028 ms)
+```
+
+Subsequent calls for the same key skip benchmarking and run only the best config.
+
+---
+
+## The `Config` class
+
+Each `Config` object encodes a single point in the tuning search space.
+
+```python
+from flydsl.autotune import Config
+
+Config(
+    # User kwargs — injected into the @jit call as keyword arguments.
+    # Use these for Constexpr parameters like tile sizes.
+    BLOCK=128,
+    BLOCK_K=64,
+
+    # Hardware hints (all optional)
+    num_warps=4,          # number of wavefronts per workgroup
+    waves_per_eu=2,       # occupancy hint for the AMDGPU scheduler
+    maxnreg=128,          # maximum VGPRs per thread
+
+    # Per-config pre-hook (called before each benchmark iteration)
+    pre_hook=None,        # callable(merged_kwargs) or None
+)
+```
+
+`Config.all_kwargs()` returns the merged dict of user kwargs and `num_warps` — these are forwarded as keyword arguments to the `@flyc.jit` function at call time.
+
+`Config.compiler_opts()` returns `waves_per_eu` and `maxnreg` as a dict. The autotuner passes these through `CompilationContext.compile_hints()`, which injects them into the MLIR pass pipeline without polluting the user-facing API.
+
+---
+
+## Cache key construction
+
+The `key` parameter controls which argument values differentiate compiled variants. The autotuner builds a cache key by extracting the listed argument values and appending the dtypes of all tensor arguments:
+
+```python
+# key=["n"] → cache key includes the value of n and the dtype of every tensor arg
+@autotune(configs=[...], key=["n"])
+@flyc.jit
+def my_kernel(A: fx.Tensor, B: fx.Tensor, n: fx.Int32, ...):
+    ...
+```
+
+For tensors in `key`, the shape tuple is used rather than the raw value. For scalars, the raw value is used. Tensor argument dtypes are always appended, so `float16` and `float32` tensors of the same shape produce separate cache entries.
+
+<Tip>
+Include in `key` every argument that changes the optimal tile size or thread count — typically problem dimensions like `M`, `N`, `K`. Exclude arguments that don't affect performance, such as pointers.
+</Tip>
+
+---
+
+## Benchmarking internals
+
+The `do_bench` helper benchmarks a kernel call using CUDA/HIP events:
+
+<Steps>
+  <Step title="Warmup">
+    Runs the kernel `warmup` times (default: 5) without recording timing. This triggers JIT compilation and warms up the GPU caches.
+  </Step>
+  <Step title="Timed repetitions">
+    Records `rep` individual timings (default: 25) using `torch.cuda.Event`. Each iteration is individually timed with `start.record()` / `end.record()` / `torch.cuda.synchronize()`.
+  </Step>
+  <Step title="Median selection">
+    Sorts all timings and returns the median value in milliseconds. The median is robust to occasional outliers from OS scheduling or cache effects.
+  </Step>
+  <Step title="Best config selection">
+    The config with the lowest median time wins. It is stored in the in-process cache and written to the JSON disk cache immediately.
+  </Step>
+</Steps>
+
+Failed configs (those that raise an exception during compilation or execution) are skipped with a warning. If all configs fail, `RuntimeError` is raised.
+
+---
+
+## Pre-hooks and post-hooks
+
+Use `pre_hook` / `post_hook` on the `@autotune` decorator for setup/teardown that should run around every benchmark call. Use `Config.pre_hook` for setup that applies only to a specific config.
+
+```python
+def reset_output(kwargs):
+    """Zero output tensor before each benchmark iteration."""
+    kwargs["C"].zero_()
+
+@autotune(
+    configs=[Config(BLOCK=128), Config(BLOCK=256)],
+    key=["n"],
+    pre_hook=reset_output,         # runs before every config's benchmark
+    reset_to_zero=["C"],           # shorthand: zero named tensors automatically
+)
+@flyc.jit
+def my_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, n: fx.Int32, BLOCK: fx.Constexpr[int]):
+    ...
+```
+
+`reset_to_zero` accepts a list of argument names. Those tensors are zeroed before each benchmark iteration using `.zero_()`.
+
+---
+
+## Disk cache
+
+Autotuning results are persisted as a JSON file at:
+
+```
+~/.flydsl/autotune/<function_name>.json
+```
+
+Override the directory with the environment variable:
+
+```bash
+export FLYDSL_AUTOTUNE_CACHE_DIR=/scratch/my_autotune_cache
+```
+
+The cache file is keyed by a serialized representation of the per-call cache key tuple. Each entry maps the key to the winning `Config` dict. The file is written immediately after each tuning run.
+
+```json
+{
+  "[\"1024\", \"('n:torch.int32',)\"]": {
+    "BLOCK": 256,
+    "num_warps": 8,
+    "waves_per_eu": 2
+  }
+}
+```
+
+<Note>
+The autotune disk cache does **not** invalidate automatically when kernel source changes. If you modify the kernel function, delete the relevant JSON file or the entire `~/.flydsl/autotune/` directory.
+</Note>
+
+---
+
+## Pruning the config space
+
+For large search spaces, supply a `prune_configs_by` callable to eliminate configs that are provably suboptimal before benchmarking:
+
+```python
+def prune(configs, sig_args):
+    """Drop configs where BLOCK > problem size."""
+    n = sig_args.get("n", 1)
+    return [c for c in configs if c.kwargs.get("BLOCK", 1) <= n]
+
+@autotune(
+    configs=[Config(BLOCK=64), Config(BLOCK=128), Config(BLOCK=256), Config(BLOCK=512)],
+    key=["n"],
+    prune_configs_by=prune,
+)
+@flyc.jit
+def my_kernel(A: fx.Tensor, n: fx.Int32, BLOCK: fx.Constexpr[int]):
+    ...
+```
+
+The pruning function receives the full list of `Config` objects and a dict of the bound arguments for the current call, and returns the filtered list to benchmark.
+
+---
+
+## Custom benchmark function
+
+Replace the default `do_bench` implementation by passing `do_bench` to `@autotune`. This is useful for kernels that require special setup (e.g., multi-GPU or graph capture scenarios):
+
+```python
+def my_bench(fn, warmup=5, rep=25, **kwargs):
+    for _ in range(warmup):
+        fn()
+    import time
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(rep):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / rep * 1000  # ms
+
+@autotune(configs=[...], key=["n"], do_bench=my_bench)
+@flyc.jit
+def my_kernel(...):
+    ...
+```
+
+<Warning>
+Custom `do_bench` implementations must return a single float representing the median latency in milliseconds. The autotuner uses `min(results, key=lambda x: x[1])` to pick the winner.
+</Warning>

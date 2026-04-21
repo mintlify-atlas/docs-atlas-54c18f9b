@@ -1,0 +1,458 @@
+---
+title: "Advanced FlyDSL Kernel Patterns and MLIR Debugging"
+description: "Preshuffle GEMM pipelines, tiled copy, MFMA atoms, SmemPtr pitfalls, multi-GPU all-reduce, JIT cache management, and MLIR IR dump workflows."
+---
+
+This guide covers advanced FlyDSL patterns drawn from the production example kernels. It assumes familiarity with the basic `@flyc.kernel` / `@flyc.jit` pattern. For an introduction, see the [Kernel Authoring](/guides/kernel-authoring) guide.
+
+## Preshuffle GEMM
+
+The preshuffle GEMM pattern pre-arranges the B matrix in hardware-friendly layout before the main computation loop. This allows the inner k-loop to issue consecutive buffer loads without runtime address remapping, significantly improving memory access efficiency on CDNA architectures.
+
+### Matrix layout and tiled structures
+
+The preshuffle pattern is configured in the `@flyc.jit` launcher. Key tiling decisions — tile sizes, copy atom widths, MMA shapes — are fixed at JIT compile time, producing a specialized binary for each configuration.
+
+```python
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+BLOCK_M = 128
+BLOCK_N = 128
+BLOCK_K = 64
+STAGES_A = 2   # double-buffering stages for A operand
+
+M, N, K = 4096, 4096, 4096
+
+@flyc.jit
+def tiledMma(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    stream: fx.Stream = fx.Stream(None),
+):
+    # Describe the preshuffle B layout in the host launcher
+    preshuffle_layout_B = fx.make_layout(
+        ((16, N // 16), (8, 4, K // 32)),
+        ((8, 16 * K), (1, 8 * 16, 8 * 16 * 4)),
+    )
+    preshuffle_B = fx.Tensor(fx.make_view(fx.get_iter(B), preshuffle_layout_B))
+
+    # Thread/value layout for G2S (global to shared) copy of A
+    val_per_thr = 8          # 16 B / f16
+    thrs_col = BLOCK_K // val_per_thr
+    thrs_row = 256 // thrs_col
+
+    tiled_copy_g2s_A = fx.make_tiled_copy(
+        fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16),
+        fx.make_layout(
+            ((thrs_col, thrs_row), (1, val_per_thr)),
+            ((thrs_row * val_per_thr, 1), (1, thrs_row)),
+        ),
+        fx.make_tile(thrs_row, BLOCK_K),
+    )
+
+    # MFMA 16×16×16 for Float16 with 4-way MN tiling
+    tiled_mma = fx.make_tiled_mma(
+        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.Float16)),
+        fx.make_layout((1, 4, 1), (0, 1, 0)),
+        fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+    )
+
+    gemm_kernel(A, preshuffle_B, C, tiled_mma, tiled_copy_g2s_A).launch(
+        grid=(M // BLOCK_M, N // BLOCK_N, 1),
+        block=(256, 1, 1),
+        smem=32768,
+        stream=stream,
+    )
+```
+
+### Kernel body with double-buffered pipeline
+
+The kernel receives pre-built `TiledMma` and `TiledCopy` objects as arguments. This pattern lets the host compute complex layout descriptors once without recomputing them on the device.
+
+```python
+@flyc.kernel
+def gemm_kernel(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    tiled_mma: fx.TiledMma,
+    tiled_copy_g2s_A: fx.TiledCopy,
+):
+    tid = fx.thread_idx.x
+    bid_x, bid_y, _ = fx.block_idx
+
+    A = fx.rocdl.make_buffer_tensor(A)
+    B = fx.rocdl.make_buffer_tensor(B)
+    C = fx.rocdl.make_buffer_tensor(C)
+
+    # Slice global tensors into per-block tiles
+    gA_k = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x, None]  # (BM, BK, k)
+    gB_k = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y, None]  # (BN, BK, k)
+    gC   = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x, bid_y] # (BM, BN)
+
+    thr_mma       = tiled_mma.thr_slice(tid)
+    thr_copy_g2s_A = tiled_copy_g2s_A.get_slice(tid)
+
+    # Copy atoms for each data path
+    uni_copy_128b    = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16)
+    buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float16)
+    buffer_copy_16b  = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.Float16)
+
+    thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(tid)
+    thr_copy_g2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(tid)
+    thr_copy_r2g_C = fx.make_tiled_copy_C(buffer_copy_16b,  tiled_mma).get_slice(tid)
+
+    # Dynamic shared memory and swizzled A view
+    smem_ptr      = fx.get_dyn_shared()
+    smem_ptr_f16  = fx.recast_iter(
+        fx.PointerType.get(fx.Float16.ir_type, fx.AddressSpace.Shared, 512),
+        smem_ptr,
+    )
+    composed_layout_A = fx.make_composed_layout(
+        fx.static(fx.SwizzleType.get(3, 3, 3)),
+        fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
+    )
+    sA = fx.make_view(smem_ptr_f16, composed_layout_A)  # (BM, BK, STAGES_A)
+
+    # Partition tensors for each copy path
+    thr_gA_k   = thr_copy_g2s_A.partition_S(gA_k)       # (VA, VM, VK, k)
+    thr_sA     = thr_copy_g2s_A.partition_D(sA)          # (VA, VM, VN, STAGES)
+    thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)          # (VA, VM, VK, STAGES)
+    thr_gB_k   = thr_copy_g2r_B.partition_S(gB_k)        # (VB, VN, VK, k)
+    thr_gC     = thr_copy_r2g_C.partition_S(gC)          # (VC, VM, VN)
+
+    # Register fragments
+    copy_frag_A  = fx.make_fragment_like(thr_sA[None, None, None, 0])
+    mma_frag_A   = thr_mma.make_fragment_A(sA[None, None, 0])
+    mma_frag_B   = fx.make_fragment_like(...)
+    mma_frag_C   = thr_mma.make_fragment_C(gC)
+
+    # ... pipeline loop (see below) ...
+
+    # Convert accumulator to f16 and write back
+    mma_frag_C_f16 = fx.make_fragment_like(mma_frag_C, fx.Float16.ir_type)
+    mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_f16)
+    mma_frag_C_f16.store(
+        fx.arith.trunc_f(fx.T.VectorType.get([64], fx.T.f16()), mma_frag_C.load())
+    )
+    fx.copy(buffer_copy_16b, mma_frag_C_retile, thr_gC)
+```
+
+### Double-buffered pipeline loop
+
+The `run_pipeline_stage` helper manages the ping-pong between two shared memory stages and interleaves global loads with MFMA computation:
+
+```python
+gA_k_stride = fx.get_scalar(gA_k.stride[2])
+gB_k_stride = fx.get_scalar(gB_k.stride[2])
+
+def run_pipeline_stage(read_stage, next_k, read_next=True):
+    write_stage = read_stage ^ 1   # toggle 0↔1
+
+    if read_next:
+        next_k = fx.Int32(next_k)
+        # Issue global loads for the next k-iteration while computing current
+        fx.copy(
+            buffer_copy_128b.set_value("soffset", next_k * gA_k_stride),
+            thr_gA_k[None, None, None, 0],
+            copy_frag_A,
+        )
+        fx.copy(
+            buffer_copy_128b.set_value("soffset", next_k * gB_k_stride),
+            thr_gB_k[None, None, None, 0],
+            mma_frag_B_retile[None, None, None, write_stage],
+        )
+
+    # Compute MFMA over the current k-slice (compile-time unrolled)
+    for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
+        fx.copy(uni_copy_128b, thr_sA_s2r[None, None, block_k_iter, read_stage],
+                mma_frag_A_retile[None, None, block_k_iter])
+        fx.gemm(tiled_mma, mma_frag_C,
+                mma_frag_A[None, None, (None, block_k_iter)],
+                mma_frag_B[None, None, (None, block_k_iter), read_stage],
+                mma_frag_C,
+                traversal_order=fx.GemmTraversalOrder.KNM)
+
+    # Write prefetched A into the next shared memory stage
+    fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+    fx.gpu.barrier()
+
+# Prolog: prefetch stage 0
+fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
+fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
+mma_frag_C.fill(0)
+fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+fx.gpu.barrier()
+
+# Main loop: two stages per Python iteration
+for k_iter in range(0, K // BLOCK_K - 2, 2):
+    run_pipeline_stage(read_stage=0, next_k=k_iter + 1)
+    run_pipeline_stage(read_stage=1, next_k=k_iter + 2)
+
+# Epilog: drain the pipeline
+run_pipeline_stage(read_stage=0, next_k=K // BLOCK_K - 1)
+run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
+```
+
+---
+
+## Instruction scheduling barriers
+
+For peak throughput, FlyDSL exposes low-level ROCm scheduling barriers that tell the hardware scheduler how many outstanding instructions of each type to wait for:
+
+```python
+from flydsl.expr import rocdl
+
+# Inside a pipeline stage or hot loop:
+rocdl.sched_dsrd(2)   # wait for 2 DS (LDS) reads to complete
+rocdl.sched_mfma(2)   # wait for 2 MFMA instructions to complete
+rocdl.sched_vmem(1)   # wait for 1 VMEM (global memory) read
+rocdl.sched_dswr(1)   # wait for 1 DS write
+rocdl.sched_barrier(0) # full scheduling barrier
+```
+
+<Warning>
+Scheduling barriers are highly architecture-specific. The patterns in `examples/04-preshuffle_gemm.py` are tuned for gfx942 (MI300X). Profile with `rocprof` before applying the same sequence to other architectures.
+</Warning>
+
+---
+
+## Tiled copy: partitioned tensors
+
+The tiled copy API from `examples/02-tiledCopy.py` shows how to copy a 2-D tile between global memory using `fx.rocdl.BufferCopy128b()` for hardware-accelerated 128-bit loads:
+
+```python
+@flyc.kernel
+def copy_kernel(A: fx.Tensor, B: fx.Tensor):
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+
+    block_m, block_n = 8, 24
+
+    A = fx.rocdl.make_buffer_tensor(A)
+    B = fx.rocdl.make_buffer_tensor(B)
+
+    # Partition the 2D tensor into (block_m × block_n) tiles
+    bA = fx.zipped_divide(A, (block_m, block_n))
+    bB = fx.zipped_divide(B, (block_m, block_n))
+    bA = fx.slice(bA, (None, bid))
+    bB = fx.slice(bB, (None, bid))
+
+    # Thread layout: 4 threads × 1, each carries 8 values
+    thr_layout = fx.make_layout((4, 1), (1, 1))
+    val_layout = fx.make_layout((1, 8), (1, 1))
+    copy_atom  = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+    tile_mn, tv_layout = fx.make_layout_tv(thr_layout, val_layout)
+
+    tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tile_mn)
+    thr_copy   = tiled_copy.get_slice(tid)
+
+    partition_src = thr_copy.partition_S(bA)
+    partition_dst = thr_copy.partition_D(bB)
+
+    frag = fx.make_fragment_like(partition_src)
+    fx.copy(copy_atom, partition_src, frag)
+    fx.copy(copy_atom, frag, partition_dst)
+
+@flyc.jit
+def tiledCopy(A: fx.Tensor, B: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+    copy_kernel(A, B).launch(grid=(15, 1, 1), block=(4, 1, 1), stream=stream)
+```
+
+<Note>
+Use `fx.rocdl.make_buffer_tensor()` for all new kernels. The legacy `buffer_ops.create_buffer_resource()` API is still functional but not recommended for new code.
+</Note>
+
+---
+
+## Tiled MMA: MFMA atoms
+
+The `examples/03-tiledMma.py` pattern demonstrates a self-contained GEMM kernel using `fx.rocdl.MFMA` atoms without shared memory, suitable as a template for building more complex pipelines:
+
+```python
+block_m, block_n, block_k = 64, 64, 8
+
+@flyc.kernel
+def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+
+    A = fx.rocdl.make_buffer_tensor(A)
+    B = fx.rocdl.make_buffer_tensor(B)
+    C = fx.rocdl.make_buffer_tensor(C)
+
+    bA = fx.zipped_divide(A, (block_m, block_k))
+    bB = fx.zipped_divide(B, (block_n, block_k))
+    bC = fx.zipped_divide(C, (block_m, block_n))
+    bA = fx.slice(bA, (None, bid))
+    bB = fx.slice(bB, (None, bid))
+    bC = fx.slice(bC, (None, bid))
+
+    # MFMA atom: 16×16×4 fp32 accumulation
+    mma_atom  = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)))
+    thr_mma   = tiled_mma.thr_slice(tid)
+
+    copy_atom   = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    thr_copy_A  = fx.make_tiled_copy_A(copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_B  = fx.make_tiled_copy_B(copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_C  = fx.make_tiled_copy_C(copy_atom, tiled_mma).get_slice(tid)
+
+    frag_A = thr_mma.make_fragment_A(bA)
+    frag_B = thr_mma.make_fragment_B(bB)
+    frag_C = thr_mma.make_fragment_C(bC)
+
+    fx.copy(copy_atom, thr_copy_A.partition_S(bA), thr_copy_A.retile(frag_A), pred=None)
+    fx.copy(copy_atom, thr_copy_B.partition_S(bB), thr_copy_B.retile(frag_B), pred=None)
+
+    frag_C.fill(0)
+    fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
+
+    fx.copy(copy_atom, thr_copy_C.retile(frag_C), thr_copy_C.partition_S(bC), pred=None)
+
+@flyc.jit
+def tiledMma(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+    gemm_kernel(A, B, C).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
+```
+
+---
+
+## SmemPtr cache clearing
+
+After any `scf.for` loop that uses `SmemPtr` objects, clear the `_view_cache` on every `SmemPtr`. The cached `ir.Value` was created inside the loop's `scf.for` region and is no longer valid (MLIR dominance) outside it.
+
+```python
+# After the scf.for loop completes:
+lds_a_ptr._view_cache = None
+lds_b_ptr._view_cache = None
+# Now safe to call lds_a_ptr.get() / lds_b_ptr.get() again
+```
+
+Failing to clear the cache results in a verifier error like `value defined in an unreachable block`.
+
+---
+
+## JIT cache management
+
+<CardGroup cols={2}>
+  <Card title="Disable disk cache" icon="ban">
+    Set `FLYDSL_RUNTIME_ENABLE_CACHE=0` when iterating on C++ passes or non-closure helpers. The in-process cache remains active for the lifetime of the Python process.
+
+    ```bash
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 python script.py
+    ```
+  </Card>
+  <Card title="Wipe the cache" icon="trash">
+    Remove the cache directory when changing the LLVM/MLIR toolchain or after a FlyDSL version upgrade.
+
+    ```bash
+    rm -rf ~/.flydsl/cache
+    ```
+  </Card>
+  <Card title="Custom cache location" icon="folder">
+    Override the default `~/.flydsl/cache/` path:
+
+    ```bash
+    export FLYDSL_RUNTIME_CACHE_DIR=/fast/nvme/flydsl_cache
+    ```
+  </Card>
+  <Card title="Compile-only mode" icon="code">
+    Compile without executing. Useful for build system integration and CI checks.
+
+    ```bash
+    COMPILE_ONLY=1 python script.py
+    ```
+  </Card>
+</CardGroup>
+
+The JIT disk cache key covers: source code hash, all dependency sources reachable from the `@flyc.jit` function, all scalar closure values (including those captured transitively by `@flyc.kernel` functions), FlyDSL version, and LLVM version. Source edits and `Constexpr` value changes invalidate the cache automatically.
+
+---
+
+## Debugging MLIR IR
+
+### Dump IR at every pass stage
+
+```bash
+FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./ir_dumps python script.py
+```
+
+This disables the disk cache and writes one `.mlir` file per pass stage to `FLYDSL_DUMP_DIR/<kernel_name>/`. Stage files are numbered sequentially: `00_origin.mlir`, `01_<pass>.mlir`, …, and a final `<N>_final_isa.s` with the ISA assembly.
+
+### Print IR from a compiled function
+
+```python
+# Trigger compilation
+vec_add(A, B, C, 1024)
+
+# Access the compiled function from the JitFunction
+jf = vec_add  # JitFunction instance
+cache_key = ...  # from jf._mem_cache
+artifact = jf._mem_cache[cache_key]
+artifact.print_ir()              # compiled MLIR (after all passes)
+artifact.print_ir(compiled=False) # original MLIR (before passes)
+```
+
+### Debug AST rewriting
+
+```bash
+FLYDSL_DEBUG_AST_DIFF=1 python script.py
+```
+
+Prints a unified diff between the original Python AST and the rewritten version. Useful for diagnosing control flow transformation issues.
+
+---
+
+## Multi-GPU patterns
+
+For multi-GPU kernels that require cross-device communication, FlyDSL supports a `custom_all_reduce` pattern. The pattern launches a kernel on each device and uses device-to-device memory accesses coordinated via a signal buffer:
+
+```python
+@flyc.kernel
+def all_reduce_kernel(
+    input_buf: fx.Tensor,
+    peer_bufs: fx.Tensor,
+    signal_buf: fx.Tensor,
+    num_gpus: fx.Constexpr[int],
+    n: fx.Int32,
+):
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+
+    # Phase 1: write local partial sum and signal readiness
+    # Phase 2: wait on peer signals, then read and accumulate peer data
+    # Phase 3: write final result
+
+    for peer in range_constexpr(num_gpus - 1):
+        # signal-based synchronization between devices
+        ...
+```
+
+<Note>
+The full `custom_all_reduce` implementation requires peer-mapped memory allocation via `torch.cuda.can_device_access_peer()` and explicit signal buffer management. Refer to `kernels/custom_all_reduce.py` for the reference implementation.
+</Note>
+
+---
+
+## Buffer tensor API
+
+Prefer `fx.rocdl.make_buffer_tensor()` over the legacy `buffer_ops` API for all global memory access. The buffer tensor API:
+
+- Produces an AMD buffer resource descriptor used by `BufferCopy*` atoms.
+- Is required by `partition_S` / `partition_D` on tiled copy objects when the source is a global tensor.
+- Works with dynamic leading-dimension tensors created with `flyc.from_dlpack(...).mark_layout_dynamic(...)`.
+
+```python
+@flyc.kernel
+def my_kernel(A: fx.Tensor, B: fx.Tensor):
+    # New API (preferred)
+    A_buf = fx.rocdl.make_buffer_tensor(A)
+    B_buf = fx.rocdl.make_buffer_tensor(B)
+
+    # Now use A_buf / B_buf with partition_S, partition_D, fx.copy, etc.
+    ...
+```
+
+The legacy `buffer_ops.create_buffer_resource(memref)` is still functional but produces a raw `i128` descriptor that does not interoperate with the tiled copy / layout algebra APIs.
